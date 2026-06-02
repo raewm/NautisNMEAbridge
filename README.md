@@ -45,7 +45,7 @@ All sentences are NMEA 0183 compliant with correct XOR checksums and `\r\n` line
 
 ## Requirements
 
-**Using the standalone executable** (`dist/nautis_nmea_bridge.exe`):
+**Using the standalone executable** (`nautis_nmea_bridge.exe`):
 - No Python installation required
 - No pip packages required
 - Just copy the `.exe` and run it
@@ -63,7 +63,7 @@ All sentences are NMEA 0183 compliant with correct XOR checksums and `\r\n` line
 
 2. **Run the bridge:**
    ```
-   python nautis_nmea_bridge.py
+   python nautis_nmea_bridge.py  OR  nautis_nmea_bridge.exe
    ```
    Defaults: reads from `127.0.0.1:53457`, sends NMEA to `127.0.0.1:10110` at 2 Hz.
 
