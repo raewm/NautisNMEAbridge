@@ -1,6 +1,6 @@
 # NAUTIS Home → NMEA 0183 UDP Bridge
 
-A production-grade, deadlock-free integration bridge that reads live telemetry from the
+Integration bridge that reads live telemetry from the
 [NAUTIS Home](https://vstep.nl/nautis-home/) maritime simulator and re-broadcasts it as
 standard NMEA 0183 sentences and AIS reports over UDP.
 
@@ -91,7 +91,7 @@ All sentences are NMEA 0183 compliant with correct XOR checksums and `\r\n` line
 
 2. **Run the bridge:**
    ```
-   python nautis_nmea_bridge.py
+   python nautis_nmea_bridge.py  OR  nautis_nmea_bridge.exe
    ```
    Defaults: reads from `127.0.0.1:53457`, sends NMEA to `127.0.0.1:10110` at 2 Hz.
 
