@@ -502,7 +502,9 @@ def run_bridge(args, classes: dict):
     req.queries.append(query)
 
     resolver = TelemetryResolver()
+    _child_dump_done = [False]  # mutable flag: dump child components once on first cycle
     backoff = 2.0
+
     interval = 1.0 / args.rate
     
     # Track throttled AIS transmission times
@@ -599,7 +601,7 @@ def run_bridge(args, classes: dict):
                                     min_d = dist
                                     own_ship_eid = veid
 
-                    # 3. Filter components belonging only to the own-ship vessel entity or its children
+                    # 3. Filter components belonging only to the own-ship vessel entity or its descendants
                     own_ship_components = {}
                     own_ship_mmsi = 0
                     own_ship_name = "Own Ship"
@@ -610,17 +612,25 @@ def run_bridge(args, classes: dict):
                         disp_comp = entities[own_ship_eid].get("vstep.entities.DisplayName")
                         own_ship_name = disp_comp.name if (disp_comp and disp_comp.name) else "Own Ship"
                         
-                        children_set = set()
-                        rel = entities[own_ship_eid].get("vstep.entities.Relations")
-                        if rel:
-                            children_set.update(rel.children)
-                            
+                        descendants = set()
+                        to_visit = [own_ship_eid]
+                        while to_visit:
+                            curr = to_visit.pop()
+                            if curr != own_ship_eid:
+                                descendants.add(curr)
+                            rel = entities.get(curr, {}).get("vstep.entities.Relations")
+                            if rel:
+                                for child in rel.children:
+                                    if child not in descendants and child != own_ship_eid:
+                                        to_visit.append(child)
+                                        
                         for (tn, eid), m in parsed_components_flat.items():
-                            if eid == own_ship_eid or eid in children_set:
+                            if eid == own_ship_eid or eid in descendants:
                                 own_ship_components[(tn, eid)] = m
                     else:
                         # Direct fallback to global flat components if own ship not resolved
                         own_ship_components = parsed_components_flat
+                        descendants = set()
 
                     # Resolve own-ship telemetry
                     has_pos = resolver.resolve(own_ship_components)
@@ -639,13 +649,11 @@ def run_bridge(args, classes: dict):
                         # --- Telemetry Sentences ---
                         if own_ship_eid is not None:
                             # 1. Rudder Angle ($IIRSA)
-                            # Look for RudderIndicatorOutput or PropulsionIndicatorOutput children
                             rudder_angles = []
                             stbd_angle = None
                             port_angle = None
                             
-                            own_rel = entities[own_ship_eid].get("vstep.entities.Relations")
-                            children_ids = list(own_rel.children) if own_rel else []
+                            children_ids = sorted(list(descendants))
                             for cid in children_ids:
                                 if cid in entities:
                                     ccomps = entities[cid]
@@ -657,7 +665,7 @@ def run_bridge(args, classes: dict):
                                     
                                     # Conventional rudder indicator
                                     if "vstep.sensors.RudderIndicatorOutput" in ccomps:
-                                        angle_deg = math.degrees(ccomps["vstep.sensors.RudderIndicatorOutput"].angle)
+                                        angle_deg = -math.degrees(ccomps["vstep.sensors.RudderIndicatorOutput"].angle)
                                         if "port" in full_cname or "left" in full_cname:
                                             port_angle = angle_deg
                                         elif "stbd" in full_cname or "starboard" in full_cname or "right" in full_cname:
@@ -667,7 +675,7 @@ def run_bridge(args, classes: dict):
                                             
                                     # Propulsion nozzle angle (waterjets/azimuth thrusters)
                                     elif "vstep.sensors.PropulsionIndicatorOutput" in ccomps:
-                                        angle_deg = math.degrees(ccomps["vstep.sensors.PropulsionIndicatorOutput"].angle)
+                                        angle_deg = -math.degrees(ccomps["vstep.sensors.PropulsionIndicatorOutput"].angle)
                                         if "port" in full_cname or "left" in full_cname:
                                             port_angle = angle_deg
                                         elif "stbd" in full_cname or "starboard" in full_cname or "right" in full_cname:
