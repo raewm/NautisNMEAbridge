@@ -1,6 +1,6 @@
 # NAUTIS Home → NMEA 0183 UDP Bridge
 
-A production-grade, deadlock-free integration bridge that reads live telemetry from the
+Integration bridge that reads live telemetry from the
 [NAUTIS Home](https://vstep.nl/nautis-home/) maritime simulator and re-broadcasts it as
 standard NMEA 0183 sentences and AIS reports over UDP.
 
@@ -8,14 +8,14 @@ Compatible with any chart plotter or navigation software that accepts NMEA 0183 
 OpenCPN, Coastal Explorer, Expedition, Furuno TZT, and others.
 
 Available in two forms:
-- **`dist/nautis_nmea_bridge.exe`** — standalone executable, no Python required
+- **`nautis_nmea_bridge.exe`** — standalone executable, no Python required
 - **`nautis_nmea_bridge.py`** — Python script, requires `pip install grpcio protobuf`
 
 ---
 
 ## Features
 
-- **Integrated Autopilot** — supports Standby, Heading (yaw hold), and Route (OpenCPN waypoint/cross-track tracking via `$APB`) modes
+- **Integrated Autopilot** — supports Standby, Heading (yaw hold), and Route (waypoint/cross-track tracking via `$APB`) modes
 - **Pre-tuned Vessel Presets** — Slow, Medium, and Fast vessel preset sliders to automatically tune the PID controller for tankers, bulkers, tugs, or patrol boats
 - **Advanced PID Override** — raw Kp, Ki, and Kd fields remain available for custom expert tuning
 - **Magnetic Variation offset** — handles True vs. Magnetic coordinate mismatch when chart plotters emit Magnetic NMEA sentences
@@ -61,7 +61,7 @@ Available in two forms:
 
 ## Requirements
 
-**Using the standalone executable** (`dist/nautis_nmea_bridge.exe`):
+**Using the standalone executable** (`nautis_nmea_bridge.exe`):
 - No Python installation required
 - No pip packages required
 - Just copy the `.exe` and run it
@@ -100,7 +100,7 @@ Available in two forms:
 
 ## Standalone Executable
 
-A pre-built Windows executable is included at `dist/nautis_nmea_bridge.exe`. It bundles the Python runtime, PySide6 GUI library, gRPC dependency, and type descriptors into a single portable file.
+A pre-built Windows executable is included at `nautis_nmea_bridge.exe`. It bundles the Python runtime, PySide6 GUI library, gRPC dependency, and type descriptors into a single portable file.
 
 ### Distribution
 
@@ -141,8 +141,7 @@ The updated executable will be written to `dist/nautis_nmea_bridge.exe`.
 
 ```
 NautisNMEAsender/
-├── dist/
-│   └── nautis_nmea_bridge.exe  ← Standalone executable (distribute this)
+├── nautis_nmea_bridge.exe      ← Standalone executable (distribute this)
 ├── nautis_nmea_bridge.py       ← gRPC client, NMEA parser, and core engine
 ├── nautis_gui.py               ← PySide6 Maritime Console GUI dashboard
 ├── autopilot.py                ← PID steering controller and $APB sentence router
@@ -150,8 +149,6 @@ NautisNMEAsender/
 ├── .gitignore                  ← Git ignore configuration for PyInstaller build artifacts
 ├── README.md                   ← This file
 ├── proto_extracted/            ← Runtime-required binary descriptors (*.proto.pb)
-└── proto_files/                ← Human-readable .proto schemas (reference)
-└── build/                      ← PyInstaller intermediate build files (safe to delete)
 ```
 
 ---
