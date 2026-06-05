@@ -1,6 +1,6 @@
 # NAUTIS Home → NMEA 0183 UDP Bridge
 
-Integration bridge that reads live telemetry from the
+A production-grade, deadlock-free integration bridge that reads live telemetry from the
 [NAUTIS Home](https://vstep.nl/nautis-home/) maritime simulator and re-broadcasts it as
 standard NMEA 0183 sentences and AIS reports over UDP.
 
@@ -15,30 +15,26 @@ Available in two forms:
 
 ## Features
 
-- **Universal vessel compatibility** — works on every vessel in NAUTIS Home, regardless
-  of its sensor loadout (GPS, compass, INS, Doppler log, or raw physics only)
-- **Own-ship automatic detection** — uses the simulator's viewport camera assignment to
-  identify the trainee's vessel; automatically falls back to coordinate proximity matching
-- **AIS vessel traffic** — broadcasts all other vessels in the scenario as Class A AIS
-  targets (`!AIVDM`) so they appear in your chart plotter alongside your own position
-- **Own-ship AIS** — emits `!AIVDO` sentences for the own-ship, including static voyage
-  data (Type 5) with vessel name and call sign
-- **Supplementary telemetry** — outputs rudder angle, engine RPM, wind speed/direction,
-  and water depth whenever the vessel's sensor loadout includes them
-- **Hierarchical telemetry fallback** — automatically selects the best available data
-  source for each metric at every poll cycle
-- **Deadlock-free** — uses a request/response polling pattern instead of the simulator's
-  streaming subscription API, which was found to cause simulator physics freezes during
-  sustained use
-- **Auto-reconnect** — exponential backoff reconnection loop; the bridge survives
-  simulator restarts without manual intervention
-- **Configurable** — poll rate, gRPC host/port, and UDP destination are all runtime arguments
+- **Integrated Autopilot** — supports Standby, Heading (yaw hold), and Route (OpenCPN waypoint/cross-track tracking via `$APB`) modes
+- **Pre-tuned Vessel Presets** — Slow, Medium, and Fast vessel preset sliders to automatically tune the PID controller for tankers, bulkers, tugs, or patrol boats
+- **Advanced PID Override** — raw Kp, Ki, and Kd fields remain available for custom expert tuning
+- **Magnetic Variation offset** — handles True vs. Magnetic coordinate mismatch when chart plotters emit Magnetic NMEA sentences
+- **Compact & Pop-Out layouts** — dock the AP panel in a mini-dashboard window or pop it out into an always-on-top window to clear your screen
+- **Universal vessel compatibility** — works on every vessel in NAUTIS Home, regardless of its sensor loadout (GPS, compass, INS, Doppler log, or raw physics only)
+- **Own-ship automatic detection** — uses the simulator's viewport camera assignment to identify the trainee's vessel; automatically falls back to coordinate proximity matching
+- **AIS vessel traffic** — broadcasts all other vessels in the scenario as Class A AIS targets (`!AIVDM`) so they appear in your chart plotter alongside your own position
+- **Own-ship AIS** — emits `!AIVDO` sentences for the own-ship, static voyage data (Type 5) with vessel name and call sign
+- **Supplementary telemetry** — outputs rudder angle, engine RPM, wind speed/direction, and water depth whenever the vessel's sensor loadout includes them
+- **Hierarchical telemetry fallback** — automatically selects the best available data source for each metric at every poll cycle
+- **Deadlock-free** — uses a request/response polling pattern instead of the simulator's streaming subscription API, which was found to cause simulator physics freezes during sustained use
+- **Auto-reconnect** — exponential backoff reconnection loop; the bridge survives simulator restarts without manual intervention
+- **Configurable** — poll rate, gRPC host/port, and UDP destinations are all configurable at runtime
 
 ---
 
-## NMEA Sentences Produced
+## NMEA Sentences Handled
 
-### Navigation (own ship)
+### Output to Chart Plotter (UDP broadcast, default port 10110)
 
 | Sentence  | Content |
 |-----------|---------|
@@ -47,27 +43,19 @@ Available in two forms:
 | `$GPVTG`  | Course and speed over ground (true, knots, km/h) |
 | `$GPHDG`  | Heading |
 | `$GPROT`  | Rate of turn (degrees per minute) |
-
-### Supplementary telemetry (when sensor present on vessel)
-
-| Sentence  | Content |
-|-----------|---------|
-| `$IIRSA`  | Rudder angle — port and/or starboard (conventional rudder or jet/azimuth nozzle) |
+| `$IIRSA`  | Rudder angle — port and/or starboard |
 | `$IIRPM`  | Engine revolutions per minute (one sentence per engine/thruster) |
-| `$IIMWV`  | Wind speed and angle — apparent and true (requires anemometer sensor) |
-| `$IIDPT`  | Depth below transducer with draught offset (requires echo sounder sensor) |
+| `$IIMWV`  | Wind speed and angle — apparent and true |
+| `$IIDPT`  | Depth below transducer with draught offset |
 | `$IIDBT`  | Depth below transducer in feet, metres, fathoms |
+| `!AIVDO`  | Own-ship Class A position report (Type 1) and static voyage data (Type 5) |
+| `!AIVDM`  | Traffic vessel Class A position report (Type 1) and static voyage data (Type 5) |
 
-### AIS
+### Input from Chart Plotter (UDP listener, default port 10115)
 
 | Sentence  | Content |
 |-----------|---------|
-| `!AIVDO`  | Own-ship Class A position report (Type 1) every 2 s |
-| `!AIVDO`  | Own-ship static voyage data (Type 5) every 10 s — vessel name, call sign |
-| `!AIVDM`  | Traffic vessel Class A position report (Type 1) every 2 s per vessel |
-| `!AIVDM`  | Traffic vessel static voyage data (Type 5) every 10 s per vessel |
-
-All sentences are NMEA 0183 compliant with correct XOR checksums and `\r\n` line endings.
+| `$APB`    | Autopilot Sentence "B" — contains cross-track error (XTE), bearing to waypoint, and destination waypoint name |
 
 ---
 
@@ -80,7 +68,7 @@ All sentences are NMEA 0183 compliant with correct XOR checksums and `\r\n` line
 
 **Using the Python script** (`nautis_nmea_bridge.py`):
 - Python 3.8 or later
-- `pip install grpcio protobuf`
+- `pip install grpcio protobuf PySide6`
 - `proto_extracted/` directory must be present alongside the script
 
 ---
@@ -89,36 +77,34 @@ All sentences are NMEA 0183 compliant with correct XOR checksums and `\r\n` line
 
 1. **Start NAUTIS Home** and load a scenario.
 
-2. **Run the bridge:**
+2. **Run the bridge (GUI Mode):**
    ```
-   python nautis_nmea_bridge.py  OR  nautis_nmea_bridge.exe
+   # Launches the PySide6 Maritime Console
+   python nautis_nmea_bridge.py
    ```
-   Defaults: reads from `127.0.0.1:53457`, sends NMEA to `127.0.0.1:10110` at 2 Hz.
+   *For headless deployment, run:*
+   ```
+   python nautis_nmea_bridge.py --cli
+   ```
 
-3. **Configure your chart plotter** to receive UDP NMEA on port `10110`.
+3. **Configure your chart plotter (e.g. OpenCPN):**
+   - **Output from Bridge:** Add a connection: Type `Network`, Protocol `UDP`, Address `0.0.0.0`, Port `10110` (Input).
+   - **Autopilot to Bridge:** Add a connection: Type `Network`, Protocol `UDP`, Address `127.0.0.1`, Port `10115` (Output). Tick "Transmit Selected Sentences" and enable only **`APB`**.
 
-   *OpenCPN example: Options → Connections → Add Connection*
-   - Type: `Network`, Protocol: `UDP`
-   - Address: `0.0.0.0`, DataPort: `10110`
-   - Tick: Input (enable AIS input on the same connection to see traffic targets)
-
-4. **Optional — verify raw NMEA output** in a second terminal:
-   ```
-   python nautis_nmea_bridge.py --verbose
-   ```
+4. **Operate the Autopilot:**
+   - **Standby Mode**: Control the helm manually inside NAUTIS Home.
+   - **Heading Mode**: The autopilot holds the current heading. Use the `−10`, `−1`, `+1`, `+10` buttons to adjust the target heading.
+   - **Route Mode**: Activate a route in OpenCPN. The bridge receives `$APB` sentences and steers the vessel along the path.
 
 ---
 
 ## Standalone Executable
 
-A pre-built Windows executable is included at `dist/nautis_nmea_bridge.exe`. It bundles
-the Python runtime, all required packages (`grpcio`, `protobuf`), and the
-`proto_extracted/` descriptors into a single portable file.
+A pre-built Windows executable is included at `dist/nautis_nmea_bridge.exe`. It bundles the Python runtime, PySide6 GUI library, gRPC dependency, and type descriptors into a single portable file.
 
 ### Distribution
 
-Only the `.exe` needs to be distributed. Copy it to any Windows machine — no Python
-installation, no pip, no additional files required:
+Only the `.exe` needs to be distributed. Copy it to any Windows machine — no Python installation, no pip, no additional files required:
 
 ```
 nautis_nmea_bridge.exe [options]
@@ -128,15 +114,9 @@ All CLI options are identical to the Python script version.
 
 ### Rebuilding the executable
 
-If NAUTIS Home is updated and the `proto_extracted/` descriptors need to be refreshed,
-rebuild the executable after re-running `grpc_probe.py`:
-
 ```
-# Step 1 — Re-extract proto descriptors (requires NAUTIS Home running)
-python grpc_probe.py
-
-# Step 2 — Rebuild using the existing spec file
-pyinstaller nautis_nmea_bridge.spec
+# Rebuild using the spec file (runs in windowed mode, suppresses blank background console)
+pyinstaller --clean nautis_nmea_bridge.spec
 ```
 
 The updated executable will be written to `dist/nautis_nmea_bridge.exe`.
@@ -149,20 +129,11 @@ The updated executable will be written to `dist/nautis_nmea_bridge.exe`.
 |---|---|---|
 | `--host HOST` | `127.0.0.1` | gRPC server host |
 | `--port PORT` | `53457` | gRPC server port |
-| `--udp-host HOST` | `127.0.0.1` | UDP destination host |
-| `--udp-port PORT` | `10110` | UDP destination port |
+| `--udp-host HOST` | `127.0.0.1` | UDP destination host (NMEA output) |
+| `--udp-port PORT` | `10110` | UDP destination port (NMEA output) |
 | `--rate RATE` | `2.0` | Poll and broadcast rate (Hz) |
-| `--verbose` | off | Print every NMEA sentence to stdout |
-
-**Send to a remote chart plotter at 5 Hz:**
-```
-python nautis_nmea_bridge.py --udp-host 192.168.1.50 --udp-port 10110 --rate 5
-```
-
-**Broadcast to all network interfaces:**
-```
-python nautis_nmea_bridge.py --udp-host 255.255.255.255
-```
+| `--verbose` | off | Print NMEA output to stdout (CLI mode only) |
+| `--cli` | off | Run in headless CLI mode instead of GUI |
 
 ---
 
@@ -172,14 +143,14 @@ python nautis_nmea_bridge.py --udp-host 255.255.255.255
 NautisNMEAsender/
 ├── dist/
 │   └── nautis_nmea_bridge.exe  ← Standalone executable (distribute this)
-├── nautis_nmea_bridge.py       ← Bridge source
-├── nautis_nmea_bridge.spec     ← PyInstaller spec for rebuilding exe
-├── grpc_probe.py               ← Re-extract proto_extracted/ if NAUTIS updates
-├── listen_nmea.py              ← Diagnostic listener (port 10110)
+├── nautis_nmea_bridge.py       ← gRPC client, NMEA parser, and core engine
+├── nautis_gui.py               ← PySide6 Maritime Console GUI dashboard
+├── autopilot.py                ← PID steering controller and $APB sentence router
+├── nautis_nmea_bridge.spec     ← PyInstaller spec for windowed build compilation
+├── .gitignore                  ← Git ignore configuration for PyInstaller build artifacts
 ├── README.md                   ← This file
-├── proto_extracted/            ← Runtime-required binary descriptors
-│   └── *.proto.pb
-├── proto_files/                ← Human-readable .proto schemas (reference)
+├── proto_extracted/            ← Runtime-required binary descriptors (*.proto.pb)
+└── proto_files/                ← Human-readable .proto schemas (reference)
 └── build/                      ← PyInstaller intermediate build files (safe to delete)
 ```
 
@@ -366,6 +337,29 @@ falling back to `OrientationEuler.angles.z` (the vessel body's raw yaw angle).
 
 ---
 
+### Phase 7 — Autopilot Control Loop (Steering Write-back)
+
+When the Autopilot is set to **Heading** or **Route** mode, the bridge executes a closed-loop PID control cycle throttled to **1 Hz** (ships respond on 3–10s timescales, making faster updates counterproductive):
+
+1. **Heading Low-Pass Filter**:
+   The own-ship gyro heading is filtered using a simple Exponential Moving Average (EMA) with $\alpha = 0.3$:
+   $$\text{filtered\_heading} = 0.3 \times \text{heading} + 0.7 \times \text{prev\_heading}$$
+   This smooths the coarse 2 Hz gRPC position/heading quantization steps, eliminating derivative kick noise in the PID controller.
+
+2. **PID Calculations**:
+   - In **Heading Mode**, the error is the difference between the filtered own-ship heading and the target heading.
+   - In **Route Mode**, the error is calculated by adding a cross-track correction to the waypoint bearing received via `$APB`:
+     $$\text{Target Heading} = \text{Bearing to Waypoint} + \text{XTE Correction}$$
+     XTE correction scales with cross-track error to guide the vessel back onto the route path.
+
+3. **External Control Actuator Lock**:
+   To prevent conflicts with the simulator's trainee helm, the bridge issues a `SetExternalControl` gRPC request targeting the own-ship's rudder actuator entity IDs. This locks the rudders to external gRPC control. On stop or switch to Standby, a release call returns control to the simulator's helm.
+
+4. **Rudder Command Rate Limiter**:
+   Commanded rudder angles are rate-limited to a maximum change of **5.0° per second** to prevent steering gear slamming. The resulting target angle (up to $\pm 25^\circ$) is packed into a `SetComponents` gRPC write-back payload and transmitted to the simulator.
+
+---
+
 ### Connection Resilience
 
 The outer reconnection loop in `run_bridge()` uses exponential backoff:
@@ -374,8 +368,7 @@ The outer reconnection loop in `run_bridge()` uses exponential backoff:
 - Doubles on each failure, capped at 30 seconds
 - Resets to 2 seconds on successful connection
 
-The bridge can be started before the simulator and will connect automatically. It
-recovers from simulator restarts without any manual intervention.
+The bridge can be started before the simulator and will connect automatically. It recovers from simulator restarts without any manual intervention.
 
 ---
 
