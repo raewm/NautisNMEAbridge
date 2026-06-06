@@ -1,6 +1,6 @@
 # NAUTIS Home → NMEA 0183 UDP Bridge
 
-A production-grade, deadlock-free integration bridge that reads live telemetry from the
+Integration bridge that reads live telemetry from the
 [NAUTIS Home](https://vstep.nl/nautis-home/) maritime simulator and re-broadcasts it as
 standard NMEA 0183 sentences and AIS reports over UDP.
 
@@ -8,7 +8,7 @@ Compatible with any chart plotter or navigation software that accepts NMEA 0183 
 OpenCPN, Coastal Explorer, Expedition, Furuno TZT, and others.
 
 Available in two forms:
-- **`dist/nautis_nmea_bridge.exe`** — standalone executable, no Python required
+- **`nautis_nmea_bridge.exe`** — standalone executable, no Python required
 - **`nautis_nmea_bridge.py`** — Python script, requires `pip install grpcio protobuf`
 
 ---
@@ -61,7 +61,7 @@ Available in two forms:
 
 ## Requirements
 
-**Using the standalone executable** (`dist/nautis_nmea_bridge.exe`):
+**Using the standalone executable** (`nautis_nmea_bridge.exe`):
 - No Python installation required
 - No pip packages required
 - Just copy the `.exe` and run it
@@ -147,7 +147,7 @@ To test the autopilot route tracking:
 
 ## Standalone Executable
 
-A pre-built Windows executable is included at `dist/nautis_nmea_bridge.exe`. It bundles the Python runtime, PySide6 GUI library, gRPC dependency, and type descriptors into a single portable file.
+A pre-built Windows executable is included at `nautis_nmea_bridge.exe`. It bundles the Python runtime, PySide6 GUI library, gRPC dependency, and type descriptors into a single portable file.
 
 ### Distribution
 
