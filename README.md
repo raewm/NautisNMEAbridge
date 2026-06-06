@@ -188,17 +188,12 @@ The updated executable will be written to `dist/nautis_nmea_bridge.exe`.
 
 ```
 NautisNMEAsender/
-├── dist/
-│   └── nautis_nmea_bridge.exe  ← Standalone executable (distribute this)
+├── nautis_nmea_bridge.exe  ← Standalone executable (distribute this)
 ├── nautis_nmea_bridge.py       ← gRPC client, NMEA parser, and core engine
 ├── nautis_gui.py               ← PySide6 Maritime Console GUI dashboard
 ├── autopilot.py                ← PID steering controller and $APB sentence router
-├── nautis_nmea_bridge.spec     ← PyInstaller spec for windowed build compilation
-├── .gitignore                  ← Git ignore configuration for PyInstaller build artifacts
 ├── README.md                   ← This file
 ├── proto_extracted/            ← Runtime-required binary descriptors (*.proto.pb)
-└── proto_files/                ← Human-readable .proto schemas (reference)
-└── build/                      ← PyInstaller intermediate build files (safe to delete)
 ```
 
 ---
