@@ -1,6 +1,6 @@
 # NAUTIS Home → NMEA 0183 UDP Bridge
 
-Integration bridge that reads live telemetry from the
+A production-grade, deadlock-free integration bridge that reads live telemetry from the
 [NAUTIS Home](https://vstep.nl/nautis-home/) maritime simulator and re-broadcasts it as
 standard NMEA 0183 sentences and AIS reports over UDP.
 
@@ -8,14 +8,14 @@ Compatible with any chart plotter or navigation software that accepts NMEA 0183 
 OpenCPN, Coastal Explorer, Expedition, Furuno TZT, and others.
 
 Available in two forms:
-- **`nautis_nmea_bridge.exe`** — standalone executable, no Python required
+- **`dist/nautis_nmea_bridge.exe`** — standalone executable, no Python required
 - **`nautis_nmea_bridge.py`** — Python script, requires `pip install grpcio protobuf`
 
 ---
 
 ## Features
 
-- **Integrated Autopilot** — supports Standby, Heading (yaw hold), and Route (waypoint/cross-track tracking via `$APB`) modes
+- **Integrated Autopilot** — supports Standby, Heading (yaw hold), and Route (OpenCPN waypoint/cross-track tracking via `$APB`) modes
 - **Pre-tuned Vessel Presets** — Slow, Medium, and Fast vessel preset sliders to automatically tune the PID controller for tankers, bulkers, tugs, or patrol boats
 - **Advanced PID Override** — raw Kp, Ki, and Kd fields remain available for custom expert tuning
 - **Magnetic Variation offset** — handles True vs. Magnetic coordinate mismatch when chart plotters emit Magnetic NMEA sentences
@@ -61,7 +61,7 @@ Available in two forms:
 
 ## Requirements
 
-**Using the standalone executable** (`nautis_nmea_bridge.exe`):
+**Using the standalone executable** (`dist/nautis_nmea_bridge.exe`):
 - No Python installation required
 - No pip packages required
 - Just copy the `.exe` and run it
@@ -87,9 +87,7 @@ Available in two forms:
    python nautis_nmea_bridge.py --cli
    ```
 
-3. **Configure your chart plotter (e.g. OpenCPN):**
-   - **Output from Bridge:** Add a connection: Type `Network`, Protocol `UDP`, Address `0.0.0.0`, Port `10110` (Input).
-   - **Autopilot to Bridge:** Add a connection: Type `Network`, Protocol `UDP`, Address `127.0.0.1`, Port `10115` (Output). Tick "Transmit Selected Sentences" and enable only **`APB`**.
+3. **Configure your chart plotter:** See the detailed [OpenCPN Connection Guide](#opencpn-connection-guide) section below.
 
 4. **Operate the Autopilot:**
    - **Standby Mode**: Control the helm manually inside NAUTIS Home.
@@ -98,9 +96,58 @@ Available in two forms:
 
 ---
 
+## OpenCPN Connection Guide
+
+To integrate the bridge with OpenCPN for both telemetry display (including AIS traffic) and active autopilot route steering, you must configure two network connections in OpenCPN:
+
+### Step 1 — Add NMEA/AIS Input Connection (Bridge → OpenCPN)
+This connection receives position, heading, depth, wind, engine data, and Class A AIS traffic targets from the simulator:
+1. In OpenCPN, open the **Options** dialog (gear icon in the top toolbar).
+2. Go to the **Connections** tab.
+3. In the **Data Connections** panel, click **Add Connection**.
+4. Configure the settings:
+   - **Type**: Select `Network`
+   - **Protocol**: Select `UDP`
+   - **Address**: Enter `0.0.0.0` (or `127.0.0.1`)
+   - **DataPort**: Enter `10110`
+   - **User Comment**: Enter `NAUTIS Telemetry & AIS Input`
+5. Ensure **Receive traffic on this port** is checked.
+6. Leave other settings at default and click **Apply**.
+
+### Step 2 — Add Autopilot Output Connection (OpenCPN → Bridge)
+This connection transmits active route steering sentences (`$APB`) from OpenCPN to the autopilot:
+1. In the **Connections** tab, click **Add Connection** again.
+2. Configure the settings:
+   - **Type**: Select `Network`
+   - **Protocol**: Select `UDP`
+   - **Address**: Enter `127.0.0.1`
+   - **DataPort**: Enter `10115`
+   - **User Comment**: Enter `NAUTIS Autopilot Control Output`
+3. Check **Output on this port (as client or multicast)**.
+
+### Step 3 — Filter Autopilot Sentences (Crucial)
+To avoid network loops and ensure the autopilot receives only the routing sentences it expects:
+1. Under the connection options for the port `10115` connection you just created, click the **Input/Output Filtering** button (under the "Output on this port" checkbox).
+2. Set **Output Filter Policy** to **`Drop all except...`**.
+3. In the text box, select or type **`APB`** and add it to the list.
+4. Click **OK** to close the filter dialog, then click **Apply** and **OK** to save options.
+
+### Step 4 — Activating a Route
+To test the autopilot route tracking:
+1. Create a route using the Route tool in OpenCPN.
+2. Right-click the route line and select **Activate Route**.
+3. Ensure the Autopilot Panel in the bridge GUI is set to **Route Mode**.
+4. In the bridge GUI, verify that:
+   - **Route Data** changes from `NO SIGNAL` to `OK`.
+   - **Waypoint** shows the active OpenCPN waypoint name.
+   - **Cross-Track Error (XTE)** shows the current cross-track deviation.
+   - The vessel begins steering to track the route.
+
+---
+
 ## Standalone Executable
 
-A pre-built Windows executable is included at `nautis_nmea_bridge.exe`. It bundles the Python runtime, PySide6 GUI library, gRPC dependency, and type descriptors into a single portable file.
+A pre-built Windows executable is included at `dist/nautis_nmea_bridge.exe`. It bundles the Python runtime, PySide6 GUI library, gRPC dependency, and type descriptors into a single portable file.
 
 ### Distribution
 
@@ -141,7 +188,8 @@ The updated executable will be written to `dist/nautis_nmea_bridge.exe`.
 
 ```
 NautisNMEAsender/
-├── nautis_nmea_bridge.exe      ← Standalone executable (distribute this)
+├── dist/
+│   └── nautis_nmea_bridge.exe  ← Standalone executable (distribute this)
 ├── nautis_nmea_bridge.py       ← gRPC client, NMEA parser, and core engine
 ├── nautis_gui.py               ← PySide6 Maritime Console GUI dashboard
 ├── autopilot.py                ← PID steering controller and $APB sentence router
@@ -149,6 +197,8 @@ NautisNMEAsender/
 ├── .gitignore                  ← Git ignore configuration for PyInstaller build artifacts
 ├── README.md                   ← This file
 ├── proto_extracted/            ← Runtime-required binary descriptors (*.proto.pb)
+└── proto_files/                ← Human-readable .proto schemas (reference)
+└── build/                      ← PyInstaller intermediate build files (safe to delete)
 ```
 
 ---
