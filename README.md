@@ -87,6 +87,7 @@ NautisHomeMods/
 └── RADAR/
     ├── README.md           ← Full Radar Display documentation
     ├── radar_display.py
+    ├── proto_extracted/    ← Runtime protobuf descriptors
     └── dist/
         └── radar_display.exe
 ```
