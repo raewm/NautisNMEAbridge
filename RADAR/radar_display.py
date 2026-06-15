@@ -4,14 +4,11 @@ radar_display.py -- NAUTIS Home Standalone Networked Radar Display
 PySide6 application that receives ASTERIX Cat 240 radar video UDP packets
 and renders a Plan Position Indicator (PPI) display.
 
-Run on the radar display computer:
+Run on the display computer:
     python radar_display.py
 
 Requirements:
     pip install PySide6 grpcio protobuf
-
-Splitter setup (on sim machine):
-    python radar_splitter.py --display <this-machine-ip>
 """
 
 import math
