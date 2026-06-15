@@ -11,15 +11,11 @@ Can be run in headless CLI mode or in GUI mode with PySide6.
 # Version  (bump this when releasing a new .exe build)
 # ---------------------------------------------------------------------------
 # Changelog:
-#   2.1.0  2026-06-14  Reorganised project into NautisHomeMods/NMEA Bridge/.
-#                      Added single-source versioning (__version__).
-#   2.0.0  2026-06-07  Integrated autopilot with Heading & Route (APB) modes,
-#                      vessel response preset slider, pop-out AP window,
-#                      compact mode, magnetic variation offset.
-#   1.0.0  2026-06-01  Initial release — gRPC polling bridge, NMEA + AIS
-#                      output, deadlock-free architecture.
-# ---------------------------------------------------------------------------
-__version__ = "2.1.0"
+#   2.2.0  2026-06-15  Fix AIS Type 1 lat/lon two's-complement encoding for
+#                      negative coordinates. Fix traffic vessel position/motion
+#                      lookup to search descendant entities, not just the root,
+#                      so all scenarios emit correct AIS targets.
+__version__ = "2.2.0"
 
 import argparse
 import math
@@ -228,7 +224,7 @@ def make_ais_sentence(payload: str, is_own: bool = False) -> str:
 def make_ais_type1(mmsi: int, lat: float, lon: float, sog_kn: float, cog_deg: float, heading_deg: float, rot_dpm: float, is_own: bool = False) -> str:
     msg_type = 1
     repeat = 0
-    mmsi = int(mmsi) & 0x3FFFFFFF
+    mmsi_val = int(mmsi) & 0x3FFFFFFF
     nav_status = 0
     
     if rot_dpm == 0.0:
@@ -245,13 +241,18 @@ def make_ais_type1(mmsi: int, lat: float, lon: float, sog_kn: float, cog_deg: fl
     sog_val = max(0, min(1022, sog_val))
     
     pos_accuracy = 1
-    lon_val = int(lon * 600000.0) & 0xFFFFFFF
-    lat_val = int(lat * 600000.0) & 0x7FFFFFF
+    # AIS lat/lon are signed integers in 1/10000 minute units (two's complement)
+    # lon: 28-bit signed, lat: 27-bit signed
+    lon_int = int(round(lon * 600000.0))
+    lat_int = int(round(lat * 600000.0))
+    lon_val = lon_int & 0xFFFFFFF   # 28-bit two's complement
+    lat_val = lat_int & 0x7FFFFFF   # 27-bit two's complement
     
-    cog_val = int(cog_deg * 10.0) % 3600
-    if cog_val < 0:
-        cog_val = 3600
+    # COG: 0–3599 in 0.1° units; 3600 = not available
+    cog_int = int(round(cog_deg * 10.0)) % 3600
+    cog_val = cog_int if cog_int >= 0 else 3600
         
+    # Heading: 0–359 degrees true; 511 = not available
     heading_val = int(heading_deg) % 360
     if heading_val < 0:
         heading_val = 511
@@ -261,7 +262,7 @@ def make_ais_type1(mmsi: int, lat: float, lon: float, sog_kn: float, cog_deg: fl
     bits = 0
     bits = (bits << 6) | msg_type
     bits = (bits << 2) | repeat
-    bits = (bits << 30) | mmsi
+    bits = (bits << 30) | mmsi_val
     bits = (bits << 4) | nav_status
     bits = (bits << 8) | (rot_ais & 0xFF)
     bits = (bits << 10) | sog_val
@@ -273,7 +274,9 @@ def make_ais_type1(mmsi: int, lat: float, lon: float, sog_kn: float, cog_deg: fl
     bits = (bits << 6) | ts
     bits = (bits << 2) | 0
     bits = (bits << 3) | 0
-    bits = (bits << 1) | 0
+    bits = (bits << 1) | 0   # RAIM flag (1 bit)
+    # Communication State (19 bits)
+    bits = (bits << 19) | 0
     
     payload = ""
     for i in range(27, -1, -1):
@@ -1008,13 +1011,47 @@ class NmeaBridgeEngine(threading.Thread):
                                         last_type5_sent[own_ship_mmsi] = t_now
 
                                 # Other traffic vessels AIS
+                                # Find all entities with MMSI that are not the own ship.
+                                # These are root vessel entities. Their spatial data
+                                # (PositionGeographic, LinearMotion, OrientationEuler) may live
+                                # on the root entity OR on a child body/sensor entity.
+                                # We walk the full descendant tree to find the first available.
                                 vessels_traffic = [eid for eid, comps in entities.items() if "vstep.equipment.MMSI" in comps and eid != own_ship_eid]
                                 for veid in vessels_traffic:
                                     vcomps = entities[veid]
                                     vmmsi = vcomps["vstep.equipment.MMSI"].identifier
                                     _vd = vcomps.get("vstep.entities.DisplayName")
                                     vname = _vd.name if (_vd and _vd.name) else f"Traffic {vmmsi}"
-                                    vpos = vcomps.get("vstep.spatial.PositionGeographic")
+
+                                    # Collect all entity IDs for this vessel (root + descendants)
+                                    v_all_eids = [veid]
+                                    v_to_visit = [veid]
+                                    v_visited = {veid}
+                                    while v_to_visit:
+                                        curr = v_to_visit.pop()
+                                        rel = entities.get(curr, {}).get("vstep.entities.Relations")
+                                        if rel:
+                                            for child in rel.children:
+                                                if child not in v_visited and child in entities:
+                                                    v_visited.add(child)
+                                                    v_all_eids.append(child)
+                                                    v_to_visit.append(child)
+
+                                    # Search all entity IDs for the first available spatial data
+                                    vpos = None
+                                    vlin = None
+                                    veuler = None
+                                    vcompass = None
+                                    for search_eid in v_all_eids:
+                                        sc = entities.get(search_eid, {})
+                                        if vpos is None:
+                                            vpos = sc.get("vstep.spatial.PositionGeographic")
+                                        if vlin is None:
+                                            vlin = sc.get("vstep.spatial.LinearMotion")
+                                        if veuler is None:
+                                            veuler = sc.get("vstep.spatial.OrientationEuler")
+                                        if vcompass is None:
+                                            vcompass = sc.get("vstep.sensors.CompassBaseOutput")
                                     
                                     if vpos:
                                         vlat = vpos.position.coordinates.latitude
@@ -1024,11 +1061,14 @@ class NmeaBridgeEngine(threading.Thread):
                                         vhdg_val = 0.0
                                         vrot_val = 0.0
 
-                                        vlin = vcomps.get("vstep.spatial.LinearMotion")
                                         if vlin:
                                             vsog_val = math.sqrt(vlin.velocity.x**2 + vlin.velocity.y**2 + vlin.velocity.z**2) * 1.9438445
-                                        veuler = vcomps.get("vstep.spatial.OrientationEuler")
-                                        if veuler:
+                                        # Prefer CompassBaseOutput for heading (radians), fall back to OrientationEuler
+                                        if vcompass:
+                                            vhdg_val = math.degrees(vcompass.heading) % 360.0
+                                            vcog_val = vhdg_val
+                                            vrot_val = math.degrees(getattr(vcompass, 'rate_of_turn', 0.0)) * 60.0
+                                        elif veuler:
                                             vhdg_val = math.degrees(veuler.angles.z) % 360.0
                                             vcog_val = vhdg_val
 

@@ -920,9 +920,15 @@ class NautisGuiWindow(QMainWindow):
 
         self._engine.start()
 
-        # Apply current vessel preset (after start so apply_vessel_preset can log)
-        preset_name = self._preset_labels[self._preset_slider.value()]
-        self._engine.apply_vessel_preset(preset_name)
+        # Apply current vessel preset from slider (interpolated PID gains)
+        _sv = self._preset_slider.value()
+        _f  = _sv / 100.0
+        _kp  = self._slowest_gains[0] + _f * (self._fastest_gains[0] - self._slowest_gains[0])
+        _ki  = self._slowest_gains[1] + _f * (self._fastest_gains[1] - self._slowest_gains[1])
+        _kd  = self._slowest_gains[2] + _f * (self._fastest_gains[2] - self._slowest_gains[2])
+        _lim = self._slowest_gains[3] + _f * (self._fastest_gains[3] - self._slowest_gains[3])
+        self._engine.update_pid_params(_kp, _ki, _kd, limit=_lim)
+        self._engine.ap_vessel_preset = f"Custom ({_sv}%)"
 
         # Push current toggle states to engine
         self._sync_toggles()

@@ -81,7 +81,7 @@ Open the file in a text editor and find the block that contains `ASTERIX radar p
 
 Leave `<_remoteIP>` set to `127.0.0.1` — do not change it.
 
-
+> **This is the only simulator-side file you need to modify.** In particular, `ExtCommunication.DataProvider.Settings.settings` does **not** need to be changed — that file relates to an unrelated NAUTIS TCP data service and is not used by this project.
 
 ### 2. Install Dependencies (If running script)
 If running `radar_display.py` directly (rather than the standalone executable), ensure you have Python 3 installed and run:
