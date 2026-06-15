@@ -89,11 +89,3 @@ NautisHomeMods/
     └── dist/
         └── radar_display.exe
 ```
-
----
-
-## Adding Future Sub-Projects
-
-Create a new subdirectory under `NautisHomeMods/` and add an entry to this file following the pattern above. Each sub-project should include:
-1. A `README.md` covering setup, dependencies, usage, and architecture
-2. A brief summary entry here with key features and entry points
