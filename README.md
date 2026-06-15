@@ -29,7 +29,8 @@ Provides a standalone, networked radar Plan Position Indicator (PPI) display for
 **Key Features**
 - Decodes EUROCONTROL ASTERIX Category 240 radar sweep packets in real time
 - PPI display with persistence/afterglow decay, range rings, bearing scale, and sweep line
-- Configurable range (0.25 – 24 NM), gain, sea clutter, rain clutter, and persistence (all controls are local to display)
+- Three experimental modes: Doppler Shift color coding (closing/opening), fading motion trails, and AIS target overlay
+- Configurable range (0.25 – 24 NM), gain, and persistence (controls are local to display). Sea/rain clutter must be adjusted in-game.
 - Integrated background UDP splitter forwards the stream to the in-game radar simultaneously
 - Optional gRPC link to simulator/NMEA Bridge to poll own-ship heading for North Up (NU) mode
 - Distributed as a standalone Windows `.exe` (`dist/radar_display.exe`) — no Python required
@@ -66,7 +67,7 @@ All sub-projects require:
 - **Python 3.8+** (if running `.py` scripts rather than the pre-built executable)
 - `proto_extracted/` binary protobuf descriptors extracted from the NAUTIS Home installation — see the individual project READMEs for details
 
-The NMEA Bridge includes a pre-built `.exe` that bundles all dependencies; the Radar Display requires a manual Python environment.
+Both the NMEA Bridge and the Radar Display include pre-built standalone `.exe` executables that bundle all dependencies.
 
 ---
 
@@ -89,3 +90,11 @@ NautisHomeMods/
     └── dist/
         └── radar_display.exe
 ```
+
+---
+
+## Adding Future Sub-Projects
+
+Create a new subdirectory under `NautisHomeMods/` and add an entry to this file following the pattern above. Each sub-project should include:
+1. A `README.md` covering setup, dependencies, usage, and architecture
+2. A brief summary entry here with key features and entry points

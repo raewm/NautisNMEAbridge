@@ -1,5 +1,7 @@
 # NAUTIS Home Standalone Networked Radar Display
 
+**Current version: `2.4.0`** — see [Changelog](#changelog) for history.
+
 This project provides a standalone, high-performance radar display application for NAUTIS Home. It allows you to output the simulator's radar video stream to another window or to a separate computer on your local network to create a more realistic cockpit/bridge simulator setup.
 
 ---
@@ -13,7 +15,7 @@ This project provides a standalone, high-performance radar display application f
                                    ▼
                        [ Radar Display (Splitter) ]
                              │                │
-        (Local loopback on 44444)            │ (Internal UDP on 54322)
+        (Local loopback on 44444)             │ (Internal UDP on 54322)
                              ▼                ▼
                     [ In-Game Radar ]   [ Radar Display (Receiver) ]
                                               │
@@ -145,7 +147,7 @@ The standalone display contains interactive controls in the sidebar:
   - **EBL (Electronic Bearing Line)**: A dashed bearing line with an outer bearing label. Adjust with spin box.
   - **VRM (Variable Range Marker)**: A dashed range circle with range labels. Adjust with spin box.
   - **PI (Parallel Index Lines)**: Offset index lines parallel to the EBL for clearing distance checks.
-- **Gain, Sea Clutter, Rain Clutter**: Adjusts radar sensitivity and clutter filtering.
+- **Gain**: Adjusts radar sensitivity locally.
 - **Persistence**: Slider to adjust phosphor screen afterglow length (from Short/Medium/Long to Infinite).
 
 ### gRPC Heading Integration:
@@ -154,7 +156,34 @@ The standalone display contains interactive controls in the sidebar:
 3. Once connected, the own-ship heading will poll at 1 Hz to enable **North Up (NU)** mode.
 
 > [!NOTE]
-> **Local Control Separation:** Standby/Transmit toggles, Gain, Sea Clutter, and Rain Clutter controls are purely local display controls. They do not alter the simulator's in-game radar settings, allowing the standalone display to act as an independent radar unit.
+> **Local Control Separation:** Standby/Transmit toggles and Gain control are purely local display controls. They do not alter the simulator's in-game radar settings, allowing the standalone display to act as an independent radar unit. Sea and rain clutter filtering should be adjusted using the in-game radar controls.
+
+---
+
+## Experimental Radar Modes
+
+The radar display includes three advanced experimental modes configured and toggled from the **Experimental Modes** section in the right sidebar:
+
+### 1. Doppler Shift Radar (Color)
+- **Description**: Colors radar echoes based on their relative velocity to your vessel to make motion and collision risks immediately obvious.
+- **Color Coding**:
+  - **Yellow (Phosphor Amber)**: Stationary targets (landmasses, buoys, anchored vessels).
+  - **Red (Closing)**: Vessels moving toward your vessel (potential collision/hazard).
+  - **Green (Opening)**: Vessels moving away from your vessel.
+- **Settings**:
+  - **Radius**: A customizable proximity radius (20m to 300m, default 80m) around resolved targets. Echoes within this radius are colored based on target motion.
+
+### 2. Motion Trails
+- **Description**: Displays a fading trail of historical positions for moving targets, making relative course and speed trends visually apparent.
+- **Settings**:
+  - **Length**: Adjusts the number of past sweeps kept in memory (2 to 20 sweeps, default 6). Historical echoes gradually fade out and shrink.
+
+### 3. AIS Target Overlay
+- **Description**: Overlays live Automatic Identification System (AIS) data blocks directly on the radar sweep.
+- **Visual Indicators**:
+  - **Vessel Icon**: A bright green triangle indicating target position, rotated to its current heading.
+  - **Course Vector**: A dashed green line showing the target's projected course and speed (representing 1 minute of travel).
+  - **Data Tag**: Displays the target's Name, Range (NM), and Speed Over Ground (SOG, knots) in bright green.
 
 ---
 
@@ -170,3 +199,16 @@ The circular screen is drawn using PySide6's `QPainter` rendering into a persist
 - **Persistence Decay**: An overlay fade operation runs at 10 FPS to simulate the gradual decay/afterglow of radar phosphor screens.
 - **Sweep Line**: Renders the sweep line tracking the active azimuth returned from the simulator.
 - **Range Rings & Bearing scale**: Renders dynamic labels, concentric rings, and a 360-degree scale.
+
+---
+
+## Changelog
+
+| Version | Date | exe in dist/ | Notes |
+|---------|------|:---:|-------|
+| **2.4.0** | 2026-06-15 | ✅ | Add ship’s heading line (white, 12 o’clock in HU / compass heading in NU). Remove non-functional Sea/Rain clutter sliders; replace with note directing users to in-game radar. Stability: 3-second gRPC timeout on all stubs, one-poll-at-a-time thread guard, controller snapshot on reconnect, remove `__import__` inside paintEvent, AIS overlay recolored to bright green. |
+| **2.3.0** | 2026-06-15 | ✅ | Fix range ring labels: values below 1.0 NM were incorrectly multiplied by 10 (e.g., 0.75 NM displayed as 7.50 NM). Now displays correct sub-NM distances with 3 decimal places. |
+| **2.2.0** | 2026-06-15 | ✅ | Add three experimental radar modes: Doppler Shift color rendering, fading target motion trails, and AIS target overlay. Add interactive sidebar controls for settings. |
+| **2.1.0** | 2026-06-14 | ✅ | Integrated splitter into the main radar display application. Removed legacy `radar_splitter.py`. |
+| **1.0.0** | 2026-06-01 | ✅ | Initial release of networked standalone PPI radar. |
+

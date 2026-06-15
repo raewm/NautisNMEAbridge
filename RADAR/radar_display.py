@@ -27,7 +27,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QColor, QFont, QPainter, QPixmap, QImage, QPen, QBrush,
     QRadialGradient, QLinearGradient, QFontMetrics, QIcon, QConicalGradient,
-    QPainterPath
+    QPainterPath, QPolygonF
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
@@ -345,7 +345,77 @@ class RadarPPI(QWidget):
         self._pi_offset_nm = 0.5
         self._standby = False
 
+        # Experimental features
+        self._doppler_enabled = False
+        self._trails_enabled = False
+        self._ais_enabled = False
+        self._doppler_radius_m = 80.0
+        self._doppler_radius_m_sq = 80.0 ** 2
+        self._trail_length = 6
+
+        # Telemetry data & history for trails
+        self._telemetry = None
+        self._target_history = {} # MMSI -> deque of (x_true, y_true, time)
+
         self._mutex = QMutex()
+
+    def set_doppler_enabled(self, enabled: bool):
+        self._doppler_enabled = enabled
+        self.update()
+
+    def set_trails_enabled(self, enabled: bool):
+        self._trails_enabled = enabled
+        if not enabled:
+            self._target_history.clear()
+        self.update()
+
+    def set_ais_enabled(self, enabled: bool):
+        self._ais_enabled = enabled
+        self.update()
+
+    def set_doppler_radius(self, radius_m: int):
+        self._doppler_radius_m = float(radius_m)
+        self._doppler_radius_m_sq = self._doppler_radius_m ** 2
+        self.update()
+
+    def set_trail_length(self, length: int):
+        self._trail_length = length
+        for mmsi in list(self._target_history.keys()):
+            old_h = list(self._target_history[mmsi])
+            self._target_history[mmsi] = deque(old_h, maxlen=length)
+        self.update()
+
+    def set_telemetry(self, telemetry: dict):
+        self._telemetry = telemetry
+        if telemetry is not None:
+            active_mmsis = set()
+            own_lat = telemetry["own_ship"]["lat"]
+            own_lon = telemetry["own_ship"]["lon"]
+            mean_lat_rad = math.radians(own_lat)
+            
+            for v in telemetry["vessels"]:
+                mmsi = v["mmsi"]
+                active_mmsis.add(mmsi)
+                
+                # Update history only for vessels in motion
+                if v["sog"] >= 0.5:
+                    v_y = (v["lat"] - own_lat) * 111139.0
+                    v_x = (v["lon"] - own_lon) * 111139.0 * math.cos(mean_lat_rad)
+                    
+                    if mmsi not in self._target_history or self._target_history[mmsi].maxlen != self._trail_length:
+                        self._target_history[mmsi] = deque(maxlen=self._trail_length)
+                    
+                    history = self._target_history[mmsi]
+                    if not history or math.sqrt((v_x - history[-1][0])**2 + (v_y - history[-1][1])**2) > 5.0:
+                        history.append((v_x, v_y, time.monotonic()))
+                else:
+                    if mmsi in self._target_history:
+                        self._target_history[mmsi].clear()
+            
+            for mmsi in list(self._target_history.keys()):
+                if mmsi not in active_mmsis:
+                    del self._target_history[mmsi]
+        self.update()
 
     def set_range_m(self, range_m: float):
         self._range_m = range_m
@@ -473,6 +543,35 @@ class RadarPPI(QWidget):
             n_cells = spoke.nb_cells
             cell_data = spoke.cells
 
+            # Pre-calculate vessel relative coordinates and motion states for Doppler Mode
+            vessels_prep = []
+            if self._doppler_enabled and self._telemetry is not None:
+                own_lat = self._telemetry["own_ship"]["lat"]
+                own_lon = self._telemetry["own_ship"]["lon"]
+                mean_lat_rad = math.radians(own_lat)
+                own_sog = self._telemetry["own_ship"]["sog"]
+                own_cog = self._telemetry["own_ship"]["cog"]
+                own_sog_mps = own_sog * 0.514444
+                own_cog_rad = math.radians(own_cog)
+                own_vx = own_sog_mps * math.sin(own_cog_rad)
+                own_vy = own_sog_mps * math.cos(own_cog_rad)
+                
+                for v in self._telemetry["vessels"]:
+                    v_y = (v["lat"] - own_lat) * 111139.0
+                    v_x = (v["lon"] - own_lon) * 111139.0 * math.cos(mean_lat_rad)
+                    
+                    in_motion = v["sog"] >= 0.5
+                    is_closing = False
+                    if in_motion:
+                        v_vx = v["sog"] * 0.514444 * math.sin(math.radians(v["cog"]))
+                        v_vy = v["sog"] * 0.514444 * math.cos(math.radians(v["cog"]))
+                        rel_vx = v_vx - own_vx
+                        rel_vy = v_vy - own_vy
+                        dot = v_x * rel_vx + v_y * rel_vy
+                        is_closing = (dot < 0)
+                    
+                    vessels_prep.append((v_x, v_y, in_motion, is_closing))
+
             for i in range(min(n_cells, len(cell_data))):
                 amp = cell_data[i]
                 if amp == 0:
@@ -496,6 +595,38 @@ class RadarPPI(QWidget):
                 px = center + range_m * px_per_meter * math.sin(az_mid_rad)
                 py = center - range_m * px_per_meter * math.cos(az_mid_rad)
 
+                # Doppler logic: recalculate color based on proximity to traffic vessels
+                if self._doppler_enabled and self._telemetry is not None:
+                    # Calculate true relative coordinates (East = +X, North = +Y)
+                    az_true = az_mid
+                    if self._orientation_mode == "Heading Up":
+                        az_true = (az_mid + self._own_heading_deg) % 360.0
+                    az_true_rad = math.radians(az_true)
+                    x_cell = range_m * math.sin(az_true_rad)
+                    y_cell = range_m * math.cos(az_true_rad)
+
+                    cell_color = None
+                    for vx, vy, in_motion, is_closing in vessels_prep:
+                        if abs(x_cell - vx) <= self._doppler_radius_m and abs(y_cell - vy) <= self._doppler_radius_m:
+                            dist_sq = (x_cell - vx)**2 + (y_cell - vy)**2
+                            if dist_sq <= self._doppler_radius_m_sq:
+                                if in_motion:
+                                    if is_closing:
+                                        cell_color = (255, 30, 30, a)    # Red: closing
+                                    else:
+                                        cell_color = (30, 255, 30, a)    # Green: opening
+                                else:
+                                    cell_color = (255, 230, 30, a)       # Yellow: stationary
+                                break
+                    
+                    if cell_color is not None:
+                        r, g, b, a = cell_color
+                    else:
+                        # Standard returns (land/buoys/clutter) color as Yellow/Amber
+                        r = amp_g
+                        g = int(amp_g * 0.85)
+                        b = 10
+
                 # Draw as a small rect to ensure coverage (cell_size in pixels)
                 cell_px = max(1.5, spoke.cell_size_m * px_per_meter)
                 painter.setPen(Qt.NoPen)
@@ -518,6 +649,18 @@ class RadarPPI(QWidget):
         self._pkt_rate = len(self._rate_window) / 5.0
 
         self.update()
+
+    def _meters_to_pixels(self, rx: float, ry: float, cx: float, cy: float, px_per_meter: float) -> QPointF:
+        """Convert relative true coordinates (rx, ry in meters: East/North) to display pixel coordinates."""
+        r = math.sqrt(rx**2 + ry**2)
+        bearing = math.degrees(math.atan2(rx, ry)) % 360.0
+        display_bearing = bearing
+        if self._orientation_mode == "Heading Up":
+            display_bearing = (bearing - self._own_heading_deg) % 360.0
+        rad = math.radians(display_bearing)
+        px = cx + r * px_per_meter * math.sin(rad)
+        py = cy - r * px_per_meter * math.cos(rad)
+        return QPointF(px, py)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -568,12 +711,119 @@ class RadarPPI(QWidget):
             painter.setPen(fan_pen)
             painter.drawLine(QPointF(cx, cy), QPointF(fan_x, fan_y))
 
+        # ── Target Motion Trails ─────────────────────────────────────────────
+        if self._trails_enabled and self._grpc_connected:
+            px_per_meter = radius / self._range_m
+            for mmsi, history in self._target_history.items():
+                n_points = len(history)
+                if n_points < 2:
+                    continue
+                is_closing = False
+                if self._telemetry is not None:
+                    for v in self._telemetry["vessels"]:
+                        if v["mmsi"] == mmsi:
+                            own_lat = self._telemetry["own_ship"]["lat"]
+                            own_lon = self._telemetry["own_ship"]["lon"]
+                            mean_lat_rad = math.radians(own_lat)
+                            v_y = (v["lat"] - own_lat) * 111139.0
+                            v_x = (v["lon"] - own_lon) * 111139.0 * math.cos(mean_lat_rad)
+                            
+                            v_vx = v["sog"] * 0.514444 * math.sin(math.radians(v["cog"]))
+                            v_vy = v["sog"] * 0.514444 * math.cos(math.radians(v["cog"]))
+                            own_sog_mps = self._telemetry["own_ship"]["sog"] * 0.514444
+                            own_cog_rad = math.radians(self._telemetry["own_ship"]["cog"])
+                            own_vx = own_sog_mps * math.sin(own_cog_rad)
+                            own_vy = own_sog_mps * math.cos(own_cog_rad)
+                            
+                            rel_vx = v_vx - own_vx
+                            rel_vy = v_vy - own_vy
+                            dot = v_x * rel_vx + v_y * rel_vy
+                            is_closing = (dot < 0)
+                            break
+                
+                for idx, (rx, ry, t_added) in enumerate(history):
+                    pct = (idx + 1) / n_points
+                    alpha = int(30 + 150 * pct)
+                    size = max(3.0, 8.0 * pct)
+                    
+                    px_point = self._meters_to_pixels(rx, ry, cx, cy, px_per_meter)
+                    trail_color = QColor(0, 180, 255, alpha) # modern cyan
+                    if self._doppler_enabled:
+                        trail_color = QColor(255, 60, 60, alpha) if is_closing else QColor(60, 255, 60, alpha)
+                    
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(trail_color)
+                    painter.drawEllipse(px_point, size / 2, size / 2)
+
+        # ── AIS Target Overlay ───────────────────────────────────────────────
+        if self._ais_enabled and self._grpc_connected and self._telemetry is not None:
+            px_per_meter = radius / self._range_m
+            own_lat = self._telemetry["own_ship"]["lat"]
+            own_lon = self._telemetry["own_ship"]["lon"]
+            mean_lat_rad = math.radians(own_lat)
+            
+            painter.setRenderHint(QPainter.TextAntialiasing, True)
+            
+            for v in self._telemetry["vessels"]:
+                v_lat = v["lat"]
+                v_lon = v["lon"]
+                
+                v_y = (v_lat - own_lat) * 111139.0
+                v_x = (v_lon - own_lon) * 111139.0 * math.cos(mean_lat_rad)
+                
+                dist_m = math.sqrt(v_x**2 + v_y**2)
+                if dist_m > self._range_m:
+                    continue
+                
+                px_point = self._meters_to_pixels(v_x, v_y, cx, cy, px_per_meter)
+                
+                # 1. Triangle rotated to heading
+                painter.save()
+                painter.translate(px_point)
+                display_hdg = v["heading"]
+                if self._orientation_mode == "Heading Up":
+                    display_hdg = (v["heading"] - self._own_heading_deg) % 360.0
+                painter.rotate(display_hdg)
+                
+                triangle = QPolygonF([
+                    QPointF(0, -6),
+                    QPointF(-4, 4),
+                    QPointF(4, 4)
+                ])
+                painter.setPen(QPen(QColor(0, 255, 80, 230), 1.5))
+                painter.setBrush(QColor(0, 60, 20, 100))
+                painter.drawPolygon(triangle)
+                painter.restore()
+                
+                # 2. Velocity vector (1 min course)
+                if v["sog"] >= 0.5:
+                    travel_dist_m = (v["sog"] * NM_TO_METERS) / 60.0
+                    dx = travel_dist_m * math.sin(math.radians(v["cog"]))
+                    dy = travel_dist_m * math.cos(math.radians(v["cog"]))
+                    
+                    vec_end = self._meters_to_pixels(v_x + dx, v_y + dy, cx, cy, px_per_meter)
+                    painter.setPen(QPen(QColor(0, 255, 80, 160), 1, Qt.DashLine))
+                    painter.drawLine(px_point, vec_end)
+                
+                # 3. Label block
+                painter.setFont(QFont("Consolas", 8, QFont.Bold))
+                painter.setPen(QColor(0, 255, 80, 240))
+                
+                label_x = px_point.x() + 8
+                label_y = px_point.y() - 6
+                painter.drawText(QPointF(label_x, label_y), v["name"])
+                
+                painter.setFont(QFont("Consolas", 7))
+                range_nm = dist_m / NM_TO_METERS
+                info_text = f"{range_nm:.2f} NM | {v['sog']:.1f} kn"
+                painter.drawText(QPointF(label_x, label_y + 11), info_text)
+
         # ── Clip to circle ───────────────────────────────────────────────────
         # Draw dark overlay outside the radar circle
         painter.setPen(Qt.NoPen)
-        outer_path = __import__("PySide6.QtGui", fromlist=["QPainterPath"]).QPainterPath()
+        outer_path = QPainterPath()
         outer_path.addRect(QRectF(0, 0, w, h))
-        inner_path = __import__("PySide6.QtGui", fromlist=["QPainterPath"]).QPainterPath()
+        inner_path = QPainterPath()
         inner_path.addEllipse(QPointF(cx, cy), radius, radius)
         clip_path = outer_path.subtracted(inner_path)
         painter.setBrush(QColor(5, 5, 5, 255))
@@ -592,9 +842,9 @@ class RadarPPI(QWidget):
             # Range label
             ring_range_nm = (self._range_m / NM_TO_METERS) * i / n_rings
             if ring_range_nm >= 1.0:
-                label = f"{ring_range_nm:.1f} NM"
+                label = f"{ring_range_nm:.2f} NM"
             else:
-                label = f"{ring_range_nm * 10:.2f} NM"
+                label = f"{ring_range_nm:.3f} NM"
             painter.setPen(QColor(0, 180, 0, 200))
             painter.setFont(QFont("Consolas", 8))
             painter.drawText(QPointF(cx + 4, cy - r_ring + 12), label)
@@ -605,6 +855,7 @@ class RadarPPI(QWidget):
         border_pen.setWidth(2)
         painter.setPen(border_pen)
         painter.drawEllipse(QPointF(cx, cy), radius, radius)
+
 
         # ── Bearing scale (ticks every 5°, major labeled every 30° - rotates with own_heading in Heading Up)
         scale_offset = 0.0
@@ -642,6 +893,19 @@ class RadarPPI(QWidget):
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(0, 255, 0, 200))
         painter.drawEllipse(QPointF(cx, cy), 3, 3)
+
+        # ── Heading Line ─────────────────────────────────────────────────────
+        # HU mode: always 12 o'clock (sweep image rotates; this line stays fixed).
+        # NU mode: rotated to current compass heading from north.
+        if self._grpc_connected:
+            hl_az_rad = 0.0 if self._orientation_mode == "Heading Up" \
+                else math.radians(self._own_heading_deg)
+            hl_length = radius * 0.92
+            hl_x = cx + hl_length * math.sin(hl_az_rad)
+            hl_y = cy - hl_length * math.cos(hl_az_rad)
+            hl_pen = QPen(QColor(255, 255, 255, 220), 2)
+            painter.setPen(hl_pen)
+            painter.drawLine(QPointF(cx, cy), QPointF(hl_x, hl_y))
 
         # ── Cardinal cross-hairs ─────────────────────────────────────────────
         cross_pen = QPen(QColor(0, 80, 0, 100))
@@ -756,7 +1020,7 @@ class RadarPPI(QWidget):
 # ─── gRPC Radar Control ────────────────────────────────────────────────────────
 
 # ─── versioning ───────────────────────────────────────────────────────────────
-__version__ = "2.1.0"
+__version__ = "2.4.0"
 
 
 def _find_proto_dir():
@@ -896,6 +1160,10 @@ class RadarController:
                 "vstep.viewports.AssignedCamera",
                 "vstep.entities.Relations",
                 "vstep.equipment.MMSI",
+                "vstep.spatial.PositionGeographic",
+                "vstep.spatial.LinearMotion",
+                "vstep.spatial.OrientationEuler",
+                "vstep.entities.DisplayName",
             ]
             classes = {}
             for t in needed:
@@ -945,7 +1213,7 @@ class RadarController:
                 request_serializer=lambda m: m.SerializeToString(),
                 response_deserializer=self._classes["vstep.entities.GetComponentsResponse"].FromString,
             )
-            resp = get_stub(req)
+            resp = get_stub(req, timeout=3.0)
             for comp in resp.data:
                 url = comp.data.type_url
                 tn = url.split("/")[-1] if "/" in url else url
@@ -978,7 +1246,7 @@ class RadarController:
                 request_serializer=lambda m: m.SerializeToString(),
                 response_deserializer=self._classes["vstep.entities.GetComponentsResponse"].FromString,
             )
-            resp = get_stub(req)
+            resp = get_stub(req, timeout=3.0)
             for comp in resp.data:
                 eid = comp.entity.id
                 if eid == self._radar_entity_id:
@@ -1024,7 +1292,7 @@ class RadarController:
                 request_serializer=lambda m: m.SerializeToString(),
                 response_deserializer=self._classes["vstep.entities.GetComponentsResponse"].FromString,
             )
-            resp = get_stub(req)
+            resp = get_stub(req, timeout=3.0)
 
             entities = {}
             for comp in resp.data:
@@ -1111,6 +1379,254 @@ class RadarController:
             print(f"[radar_ctrl] get_heading failed: {e}")
         return None
 
+    def poll_telemetry(self) -> dict | None:
+        """Poll simulator for full telemetry (own-ship and traffic vessels)."""
+        if not self._connected:
+            return None
+        try:
+            needed_types = [
+                "vstep.sensors.CompassBaseOutput",
+                "vstep.viewports.AssignedCamera",
+                "vstep.entities.Relations",
+                "vstep.equipment.MMSI",
+                "vstep.spatial.PositionGeographic",
+                "vstep.spatial.LinearMotion",
+                "vstep.spatial.OrientationEuler",
+                "vstep.entities.DisplayName"
+            ]
+            for t in needed_types:
+                if t not in self._classes:
+                    return None
+
+            sel = self._classes["vstep.entities.EntitySelection"]()
+            sel.all_root_entities.CopyFrom(self._classes["vstep.entities.AllRootEntities"]())
+            sel.recursion = 99
+
+            query = self._classes["vstep.entities.GetComponentsRequest.Query"]()
+            for t in needed_types:
+                query.component_types.append(t)
+            query.entities.append(sel)
+
+            req = self._classes["vstep.entities.GetComponentsRequest"]()
+            req.queries.append(query)
+
+            get_stub = self._channel.unary_unary(
+                "/vstep.entities.Registry/GetComponents",
+                request_serializer=lambda m: m.SerializeToString(),
+                response_deserializer=self._classes["vstep.entities.GetComponentsResponse"].FromString,
+            )
+            resp = get_stub(req, timeout=3.0)
+
+            entities = {}
+            for comp in resp.data:
+                url = comp.data.type_url
+                tn = url.split("/")[-1] if "/" in url else url
+                eid = comp.entity.id
+                if eid not in entities:
+                    entities[eid] = {}
+                
+                # Reconstruct full component type name
+                full_tn = tn
+                if tn == "CompassBaseOutput":
+                    full_tn = "vstep.sensors.CompassBaseOutput"
+                elif tn == "AssignedCamera":
+                    full_tn = "vstep.viewports.AssignedCamera"
+                elif tn in ("Relations", "Name", "DisplayName"):
+                    full_tn = f"vstep.entities.{tn}"
+                elif tn == "MMSI":
+                    full_tn = "vstep.equipment.MMSI"
+                elif tn in ("PositionGeographic", "LinearMotion", "OrientationEuler"):
+                    full_tn = f"vstep.spatial.{tn}"
+                
+                entities[eid][tn] = comp.data
+                entities[eid][full_tn] = comp.data
+
+            parsed_entities = {}
+            for eid, comps in entities.items():
+                parsed_entities[eid] = {}
+                for key, any_msg in comps.items():
+                    for t in needed_types:
+                        if t.endswith(key) or key == t:
+                            try:
+                                msg = self._classes[t]()
+                                msg.MergeFromString(any_msg.value)
+                                parsed_entities[eid][t] = msg
+                            except Exception:
+                                pass
+
+            # Resolve own-ship EID
+            own_ship_eid = None
+            camera_eid = None
+            for eid, comps in parsed_entities.items():
+                if "vstep.viewports.AssignedCamera" in comps:
+                    camera_eid = comps["vstep.viewports.AssignedCamera"].entity
+                    break
+
+            parent_map = {}
+            for eid, comps in parsed_entities.items():
+                rel = comps.get("vstep.entities.Relations")
+                if rel:
+                    for child in rel.children:
+                        parent_map[child] = eid
+
+            if camera_eid:
+                curr = camera_eid
+                path = []
+                while True:
+                    parent = parent_map.get(curr)
+                    if parent:
+                        path.append(parent)
+                        curr = parent
+                    else:
+                        break
+                for peid in path:
+                    if peid in parsed_entities and "vstep.equipment.MMSI" in parsed_entities[peid]:
+                        own_ship_eid = peid
+                        break
+
+            # If still not found, search by position proximity or pick the first entity with CompassBaseOutput
+            if own_ship_eid is None:
+                for eid, comps in parsed_entities.items():
+                    if "vstep.sensors.CompassBaseOutput" in comps and "vstep.spatial.PositionGeographic" in comps:
+                        own_ship_eid = eid
+                        break
+
+            if own_ship_eid is None:
+                # Fallback to any entity with CompassBaseOutput
+                for eid, comps in parsed_entities.items():
+                    if "vstep.sensors.CompassBaseOutput" in comps:
+                        own_ship_eid = eid
+                        break
+
+            if own_ship_eid is None:
+                return None
+
+            # Build own-ship telemetry
+            own_heading = 0.0
+            own_descendants = set()
+            to_visit = [own_ship_eid]
+            while to_visit:
+                curr = to_visit.pop()
+                if curr != own_ship_eid:
+                    own_descendants.add(curr)
+                rel = parsed_entities.get(curr, {}).get("vstep.entities.Relations")
+                if rel:
+                    for child in rel.children:
+                        if child not in own_descendants and child != own_ship_eid:
+                            to_visit.append(child)
+
+            own_eids = [own_ship_eid] + list(own_descendants)
+            
+            own_gps_pos = None
+            own_linear = None
+            own_euler = None
+            for eid in own_eids:
+                sc = parsed_entities.get(eid, {})
+                if own_gps_pos is None:
+                    own_gps_pos = sc.get("vstep.spatial.PositionGeographic")
+                if own_linear is None:
+                    own_linear = sc.get("vstep.spatial.LinearMotion")
+                if own_euler is None:
+                    own_euler = sc.get("vstep.spatial.OrientationEuler")
+                if "vstep.sensors.CompassBaseOutput" in sc:
+                    own_heading = math.degrees(sc["vstep.sensors.CompassBaseOutput"].heading) % 360.0
+
+            if own_gps_pos is None:
+                return None
+
+            own_lat = own_gps_pos.position.coordinates.latitude
+            own_lon = own_gps_pos.position.coordinates.longitude
+            
+            own_sog = 0.0
+            if own_linear:
+                own_sog = math.sqrt(own_linear.velocity.x**2 + own_linear.velocity.y**2 + own_linear.velocity.z**2) * 1.9438445
+            
+            own_cog = own_heading
+            if own_euler:
+                if own_heading == 0.0:
+                    own_heading = math.degrees(own_euler.angles.z) % 360.0
+                own_cog = math.degrees(own_euler.angles.z) % 360.0
+
+            own_data = {
+                "heading": own_heading,
+                "lat": own_lat,
+                "lon": own_lon,
+                "sog": own_sog,
+                "cog": own_cog
+            }
+
+            # Build other vessels' data
+            vessels_data = []
+            for veid, comps in parsed_entities.items():
+                if "vstep.equipment.MMSI" in comps and veid != own_ship_eid:
+                    mmsi_val = comps["vstep.equipment.MMSI"].identifier
+                    disp_comp = comps.get("vstep.entities.DisplayName")
+                    vname = disp_comp.name if (disp_comp and disp_comp.name) else f"Traffic {mmsi_val}"
+
+                    v_descendants = set()
+                    v_to_visit = [veid]
+                    while v_to_visit:
+                        curr = v_to_visit.pop()
+                        if curr != veid:
+                            v_descendants.add(curr)
+                        rel = parsed_entities.get(curr, {}).get("vstep.entities.Relations")
+                        if rel:
+                            for child in rel.children:
+                                if child not in v_descendants and child != veid:
+                                    v_to_visit.append(child)
+
+                    v_eids = [veid] + list(v_descendants)
+                    vpos = None
+                    vlin = None
+                    veuler = None
+                    vcompass = None
+                    for eid in v_eids:
+                        sc = parsed_entities.get(eid, {})
+                        if vpos is None:
+                            vpos = sc.get("vstep.spatial.PositionGeographic")
+                        if vlin is None:
+                            vlin = sc.get("vstep.spatial.LinearMotion")
+                        if veuler is None:
+                            veuler = sc.get("vstep.spatial.OrientationEuler")
+                        if vcompass is None:
+                            vcompass = sc.get("vstep.sensors.CompassBaseOutput")
+
+                    if vpos:
+                        vlat = vpos.position.coordinates.latitude
+                        vlon = vpos.position.coordinates.longitude
+                        vsog = 0.0
+                        vcog = 0.0
+                        vhdg = 0.0
+
+                        if vlin:
+                            vsog = math.sqrt(vlin.velocity.x**2 + vlin.velocity.y**2 + vlin.velocity.z**2) * 1.9438445
+                        
+                        if vcompass:
+                            vhdg = math.degrees(vcompass.heading) % 360.0
+                            vcog = vhdg
+                        elif veuler:
+                            vhdg = math.degrees(veuler.angles.z) % 360.0
+                            vcog = vhdg
+
+                        vessels_data.append({
+                            "mmsi": mmsi_val,
+                            "name": vname,
+                            "lat": vlat,
+                            "lon": vlon,
+                            "sog": vsog,
+                            "cog": vcog,
+                            "heading": vhdg
+                        })
+
+            return {
+                "own_ship": own_data,
+                "vessels": vessels_data
+            }
+
+        except Exception as e:
+            print(f"[radar_ctrl] poll_telemetry failed: {e}")
+        return None
+
     def _set_component(self, entity_id: int, component_msg):
         """Send a SetComponents call."""
         if not self._connected:
@@ -1142,26 +1658,6 @@ class RadarController:
             return
         params = self._classes["vstep.radar.RadarParams"]()
         params.gain = gain_norm
-        self._set_component(self._radar_entity_id, params)
-
-    def set_sea_clutter(self, strength: float):
-        """Set sea clutter filter strength (0.0–1.0)."""
-        if "vstep.radar.ClutterParams" not in self._classes:
-            return
-        if not self._ensure_radar_entity():
-            return
-        params = self._classes["vstep.radar.ClutterParams"]()
-        params.sea_filter_strength = strength
-        self._set_component(self._radar_entity_id, params)
-
-    def set_rain_clutter(self, strength: float):
-        """Set rain clutter filter strength (0.0–1.0)."""
-        if "vstep.radar.ClutterParams" not in self._classes:
-            return
-        if not self._ensure_radar_entity():
-            return
-        params = self._classes["vstep.radar.ClutterParams"]()
-        params.rain_filter_strength = strength
         self._set_component(self._radar_entity_id, params)
 
     def set_transmit(self, enabled: bool):
@@ -1257,6 +1753,7 @@ class ConnectionDialog(QDialog):
 class RadarMainWindow(QMainWindow):
     grpc_connected = Signal(bool, str, object)
     heading_received = Signal(float)
+    telemetry_received = Signal(dict)
 
     def __init__(self):
         super().__init__()
@@ -1276,6 +1773,7 @@ class RadarMainWindow(QMainWindow):
         self._splitter_thread = None
 
         self._controller = RadarController(self._grpc_host, self._grpc_port)
+        self._poll_active = threading.Event()  # One poll thread at a time
         self._transmitting = True
 
         self._build_ui()
@@ -1284,14 +1782,15 @@ class RadarMainWindow(QMainWindow):
         self._start_receiver()
         self._start_splitter()
 
-        # Heading poll timer (1 Hz)
+        # Heading/Telemetry poll timer (1 Hz)
         self._heading_timer = QTimer(self)
         self._heading_timer.setInterval(1000)
-        self._heading_timer.timeout.connect(self._poll_heading)
+        self._heading_timer.timeout.connect(self._poll_telemetry)
 
         # Connect thread-safe signals
         self.grpc_connected.connect(self._on_grpc_connected_result)
         self.heading_received.connect(self._ppi.set_heading)
+        self.telemetry_received.connect(self._on_telemetry_received)
 
     # ── UI Construction ───────────────────────────────────────────────────────
 
@@ -1358,6 +1857,13 @@ class RadarMainWindow(QMainWindow):
         self._range_combo.setCurrentIndex(4)  # Default 3 NM
         self._range_combo.currentIndexChanged.connect(self._on_range_changed)
         range_layout.addWidget(self._range_combo)
+
+        # ── Clutter Note ─────────────────────────────────────────────────
+        clutter_lbl = QLabel("Sea/Rain clutter:\nuse in-game radar")
+        clutter_lbl.setAlignment(Qt.AlignCenter)
+        clutter_lbl.setFont(QFont("Consolas", 7))
+        clutter_lbl.setStyleSheet("color: #446644; padding: 2px;")
+        layout.addWidget(clutter_lbl)
         layout.addWidget(range_group)
 
         # ── Orientation ────────────────────────────────────────────────────
@@ -1432,13 +1938,6 @@ class RadarMainWindow(QMainWindow):
         layout.addWidget(self._make_slider_group("Gain", "gain_slider",
                          0, 200, 100, self._on_gain))
 
-        # ── Sea Clutter ────────────────────────────────────────────────────
-        layout.addWidget(self._make_slider_group("Sea Clutter", "sea_slider",
-                         0, 100, 0, self._on_sea))
-
-        # ── Rain Clutter ───────────────────────────────────────────────────
-        layout.addWidget(self._make_slider_group("Rain Clutter", "rain_slider",
-                         0, 100, 0, self._on_rain))
 
         # ── Persistence ────────────────────────────────────────────────────
         def format_persistence(v):
@@ -1450,6 +1949,58 @@ class RadarMainWindow(QMainWindow):
 
         layout.addWidget(self._make_slider_group("Persistence", "persist_slider",
                          0, 100, 0, self._on_persistence, formatter=format_persistence))
+
+        # ── Experimental Modes ──────────────────────────────────────────────
+        exp_group = QGroupBox("Experimental Modes")
+        exp_layout = QVBoxLayout(exp_group)
+        exp_layout.setSpacing(4)
+        exp_layout.setContentsMargins(6, 6, 6, 6)
+
+        # Doppler Shift Mode
+        self._doppler_cb = QCheckBox("Doppler Shift (Color)")
+        self._doppler_cb.setChecked(False)
+        self._doppler_cb.toggled.connect(self._ppi.set_doppler_enabled)
+        exp_layout.addWidget(self._doppler_cb)
+
+        # Proximity Radius row
+        rad_row = QHBoxLayout()
+        rad_lbl = QLabel("Radius:")
+        rad_lbl.setFont(QFont("Consolas", 8))
+        self._rad_spin = QSpinBox()
+        self._rad_spin.setRange(20, 300)
+        self._rad_spin.setValue(80)
+        self._rad_spin.setSuffix("m")
+        self._rad_spin.setSingleStep(10)
+        self._rad_spin.valueChanged.connect(self._ppi.set_doppler_radius)
+        rad_row.addWidget(rad_lbl)
+        rad_row.addWidget(self._rad_spin)
+        exp_layout.addLayout(rad_row)
+
+        # Target Trails Mode
+        self._trails_cb = QCheckBox("Motion Trails")
+        self._trails_cb.setChecked(False)
+        self._trails_cb.toggled.connect(self._ppi.set_trails_enabled)
+        exp_layout.addWidget(self._trails_cb)
+
+        # Trail Length row
+        len_row = QHBoxLayout()
+        len_lbl = QLabel("Length:")
+        len_lbl.setFont(QFont("Consolas", 8))
+        self._len_spin = QSpinBox()
+        self._len_spin.setRange(2, 20)
+        self._len_spin.setValue(6)
+        self._len_spin.valueChanged.connect(self._ppi.set_trail_length)
+        len_row.addWidget(len_lbl)
+        len_row.addWidget(self._len_spin)
+        exp_layout.addLayout(len_row)
+
+        # AIS Target Overlay
+        self._ais_cb = QCheckBox("AIS Target Overlay")
+        self._ais_cb.setChecked(False)
+        self._ais_cb.toggled.connect(self._ppi.set_ais_enabled)
+        exp_layout.addWidget(self._ais_cb)
+
+        layout.addWidget(exp_group)
 
         layout.addStretch()
 
@@ -1513,6 +2064,29 @@ class RadarMainWindow(QMainWindow):
                 subcontrol-origin: margin;
                 left: 6px;
                 padding: 0 4px;
+            }
+            QCheckBox {
+                font-family: Consolas;
+                font-size: 9px;
+                color: #00CC00;
+            }
+            QCheckBox::indicator {
+                width: 10px;
+                height: 10px;
+                border: 1px solid #005500;
+                background-color: #001100;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #009900;
+                border-color: #00FF00;
+            }
+            QSpinBox {
+                background-color: #001100;
+                border: 1px solid #004400;
+                color: #00CC00;
+                font-family: Consolas;
+                font-size: 9px;
+                padding: 1px;
             }
             QSlider::groove:horizontal {
                 height: 6px;
@@ -1625,11 +2199,6 @@ class RadarMainWindow(QMainWindow):
         gain = value / 100.0  # 0–2.0
         self._ppi.set_gain(gain)
 
-    def _on_sea(self, value: int):
-        pass
-
-    def _on_rain(self, value: int):
-        pass
 
     def _on_persistence(self, value: int):
         self._ppi.set_persistence(value)
@@ -1706,19 +2275,42 @@ class RadarMainWindow(QMainWindow):
             self._status_label.setText(f"Connection failed:\n{msg}")
             self._status_label.setStyleSheet("color: #FF4400;")
 
-    def _poll_heading(self):
-        """Poll simulator for own-ship heading in a background thread."""
+    def _poll_telemetry(self):
+        """Poll simulator for full telemetry in a background thread.
+        Only one poll thread runs at a time; skips ticks if previous poll is still in flight.
+        """
         if not self._controller._connected:
             self._heading_timer.stop()
             self._ppi.set_grpc_connected(False)
             return
 
+        if self._poll_active.is_set():
+            return  # Previous poll still in progress — skip this tick
+
+        controller = self._controller  # Snapshot to avoid race with reconnect
+
         def _do_poll():
-            hdg = self._controller.get_heading()
-            if hdg is not None:
-                self.heading_received.emit(hdg)
+            self._poll_active.set()
+            try:
+                telemetry = controller.poll_telemetry()
+                if telemetry is not None:
+                    try:
+                        self.telemetry_received.emit(telemetry)
+                    except RuntimeError:
+                        pass  # Widget destroyed before emit could complete
+            finally:
+                self._poll_active.clear()
 
         threading.Thread(target=_do_poll, daemon=True).start()
+
+    def _on_telemetry_received(self, telemetry: dict):
+        """Handle telemetry from background thread."""
+        self._ppi.set_grpc_connected(True)
+        # Update heading for North Up mode
+        hdg = telemetry["own_ship"]["heading"]
+        self._ppi.set_heading(hdg)
+        # Pass full telemetry to PPI for Doppler, trails, and AIS overlay
+        self._ppi.set_telemetry(telemetry)
 
     def _on_status_changed(self, msg: str):
         self._status_label.setText(msg)
