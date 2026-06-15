@@ -205,6 +205,23 @@ NMEA Bridge/
 
 ---
 
+## Port Allocation & Compatibility
+
+The NMEA Bridge uses the following ports for network communication:
+
+| Program / Service | Port | Protocol | Direction | Purpose |
+|-------------------|------|----------|-----------|---------|
+| NAUTIS Simulator | 53457 | gRPC | Inbound | Simulator Registry API |
+| NMEA Bridge | 53457 | gRPC | Outbound | Connects as client to poll telemetry & write autopilot commands |
+| NMEA Bridge | 10110 | UDP | Outbound | Broadcasts NMEA 0183 sentences & AIS targets to chart plotter |
+| NMEA Bridge | 10115 | UDP | Inbound | Listens for incoming autopilot routing sentences (`$APB`) |
+
+### Coexistence with Standalone Radar
+- The NMEA Bridge and the **Radar Display** both connect to the simulator's gRPC server on port `53457` as **clients**. gRPC supports multiple simultaneous client connections, so running both programs at the same time does not cause port conflicts.
+- The NMEA Bridge uses port `10110` and `10115` for UDP NMEA data, which are completely separate from the Radar's UDP ASTERIX data ports (`54321` and `54322`). Both programs can run together without any network overlap.
+
+---
+
 ## Architecture
 
 ### Overview

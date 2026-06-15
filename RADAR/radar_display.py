@@ -29,13 +29,14 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QColor, QFont, QPainter, QPixmap, QImage, QPen, QBrush,
-    QRadialGradient, QLinearGradient, QFontMetrics, QIcon, QConicalGradient
+    QRadialGradient, QLinearGradient, QFontMetrics, QIcon, QConicalGradient,
+    QPainterPath
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QSlider, QPushButton, QComboBox, QGroupBox, QSizePolicy,
-    QLineEdit, QSpinBox, QDialog, QFormLayout, QDialogButtonBox,
-    QMessageBox, QFrame
+    QLineEdit, QSpinBox, QDoubleSpinBox, QDialog, QFormLayout, QDialogButtonBox,
+    QMessageBox, QFrame, QCheckBox
 )
 
 # ─── ASTERIX Cat 240 Decoder ──────────────────────────────────────────────────
@@ -152,7 +153,7 @@ class AsterixReceiver(QThread):
     spoke_received = Signal(object)   # emits RadarSpoke
     status_changed = Signal(str)
 
-    def __init__(self, port: int = 54321, parent=None):
+    def __init__(self, port: int = 54322, parent=None):
         super().__init__(parent)
         self.port = port
         self._stop_event = threading.Event()
@@ -189,6 +190,71 @@ class AsterixReceiver(QThread):
                         pass
             except OSError as e:
                 self.status_changed.emit(f"Socket error: {e}")
+                time.sleep(3)
+            finally:
+                if self._sock:
+                    try:
+                        self._sock.close()
+                    except Exception:
+                        pass
+
+
+class RadarSplitterThread(QThread):
+    status_changed = Signal(str)
+
+    def __init__(self, listen_port: int = 54321, ingame_port: int = 44444,
+                 display_hosts=None, display_port: int = 54322,
+                 forward_ingame: bool = True, parent=None):
+        super().__init__(parent)
+        self.listen_port = listen_port
+        self.ingame_port = ingame_port
+        self.display_hosts = display_hosts or []
+        self.display_port = display_port
+        self.forward_ingame = forward_ingame
+        self._stop_event = threading.Event()
+        self._sock = None
+
+    def stop(self):
+        self._stop_event.set()
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+
+    def run(self):
+        self._stop_event.clear()
+        
+        # Build destinations list
+        destinations = []
+        if self.forward_ingame:
+            destinations.append(("127.0.0.1", self.ingame_port))
+        for host in self.display_hosts:
+            if host.strip():
+                destinations.append((host.strip(), self.display_port))
+                
+        while not self._stop_event.is_set():
+            try:
+                self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self._sock.bind(("0.0.0.0", self.listen_port))
+                self._sock.settimeout(1.0)
+                
+                send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.status_changed.emit(f"Splitter listening on port {self.listen_port}")
+                
+                while not self._stop_event.is_set():
+                    try:
+                        data, addr = self._sock.recvfrom(65535)
+                        for dst_ip, dst_port in destinations:
+                            try:
+                                send_sock.sendto(data, (dst_ip, dst_port))
+                            except Exception:
+                                pass
+                    except socket.timeout:
+                        pass
+            except OSError as e:
+                self.status_changed.emit(f"Splitter error: {e}")
                 time.sleep(3)
             finally:
                 if self._sock:
@@ -248,7 +314,11 @@ class RadarPPI(QWidget):
 
         self._range_m = 3.0 * NM_TO_METERS  # Default 3 NM
         self._gain = 1.0           # 0.0–2.0 gain multiplier
-        self._persistence = 0.85   # How much each frame decays (0=none, 0.99=max)
+
+        # Persistence: each spoke erases its own wedge before drawing.
+        # _clear_alpha=255 = full erase (single sweep), 0 = no erase (infinite ghost)
+        # Slider 0 → 255 (default), slider 100 → 0
+        self._clear_alpha = 255
 
         # Persistence buffer — ARGB32 image, updated per spoke
         self._ppi_image = None
@@ -264,21 +334,79 @@ class RadarPPI(QWidget):
         self._pkt_rate = 0.0
         self._rate_window = deque()
 
-        # Fade timer — applies persistence decay every N ms
-        self._fade_timer = QTimer(self)
-        self._fade_timer.timeout.connect(self._apply_fade)
-        self._fade_timer.start(100)  # 10 fps fade
+        # Orientation & Heading
+        self._orientation_mode = "Heading Up"
+        self._own_heading_deg = 0.0
+        self._grpc_connected = False
+
+        # Plotting tools attributes
+        self._ebl_enabled = False
+        self._ebl_bearing = 0
+        self._vrm_enabled = False
+        self._vrm_range_nm = 1.0
+        self._pi_enabled = False
+        self._pi_offset_nm = 0.5
+        self._standby = False
 
         self._mutex = QMutex()
 
     def set_range_m(self, range_m: float):
         self._range_m = range_m
 
+    def set_standby(self, standby: bool):
+        if self._standby != standby:
+            self._standby = standby
+            if standby and self._ppi_image is not None:
+                self._ppi_image.fill(QColor(0, 0, 0, 255))
+            self.update()
+
     def set_gain(self, gain: float):
         self._gain = gain  # 0.0 – 2.0
 
-    def set_persistence(self, p: float):
-        self._persistence = p
+    def set_persistence(self, p_slider_val: int):
+        # Slider 0   → _clear_alpha 255 = full erase per spoke (single sweep, default)
+        # Slider 100 → _clear_alpha   0 = no erase (full ghost, targets accumulate)
+        self._clear_alpha = int((1.0 - p_slider_val / 100.0) * 255)
+
+    def set_grpc_connected(self, connected: bool):
+        self._grpc_connected = connected
+        self.update()
+
+    def set_orientation_mode(self, mode: str):
+        if self._orientation_mode != mode:
+            self._orientation_mode = mode
+            if self._ppi_image is not None:
+                self._ppi_image.fill(QColor(0, 0, 0, 255))
+            self.update()
+
+    def set_heading(self, heading: float):
+        if self._own_heading_deg != heading:
+            self._own_heading_deg = heading
+            self.update()
+
+    def set_ebl_enabled(self, enabled: bool):
+        self._ebl_enabled = enabled
+        self.update()
+
+    def set_ebl_bearing(self, bearing: int):
+        self._ebl_bearing = bearing
+        self.update()
+
+    def set_vrm_enabled(self, enabled: bool):
+        self._vrm_enabled = enabled
+        self.update()
+
+    def set_vrm_range_nm(self, range_nm: float):
+        self._vrm_range_nm = range_nm
+        self.update()
+
+    def set_pi_enabled(self, enabled: bool):
+        self._pi_enabled = enabled
+        self.update()
+
+    def set_pi_offset_nm(self, offset_nm: float):
+        self._pi_offset_nm = offset_nm
+        self.update()
 
     def _ensure_ppi_image(self, size: int):
         if self._ppi_image is None or self._ppi_size != size:
@@ -288,6 +416,8 @@ class RadarPPI(QWidget):
 
     def add_spoke(self, spoke: RadarSpoke):
         """Draw a radar spoke onto the persistence buffer."""
+        if self._standby:
+            return
         with QMutexLocker(self._mutex):
             # Determine PPI image size based on current widget size
             side = min(self.width(), self.height()) - 4
@@ -298,13 +428,51 @@ class RadarPPI(QWidget):
             center = side / 2.0
             px_per_meter = center / self._range_m
 
-            # Mid-azimuth for this spoke
-            az_mid_rad = math.radians((spoke.start_az_deg + spoke.end_az_deg) / 2.0)
+            # Azimuth bounds for this spoke
+            az_start = spoke.start_az_deg
+            az_end   = spoke.end_az_deg
+            az_mid   = (az_start + az_end) / 2.0
+            if self._orientation_mode == "North Up" and self._grpc_connected:
+                offset = self._own_heading_deg
+                az_start = (az_start + offset) % 360.0
+                az_end   = (az_end   + offset) % 360.0
+                az_mid   = (az_mid   + offset) % 360.0
+            az_mid_rad = math.radians(az_mid)
 
-            # Draw cells
             painter = QPainter(self._ppi_image)
             painter.setRenderHint(QPainter.Antialiasing, False)
 
+            # ── Sweep-synchronous clear ─────────────────────────────────────
+            # Erase the wedge the sweep is about to paint.  At _clear_alpha=255
+            # this gives a clean single-sweep display; lower values leave a
+            # fading ghost of previous rotations.
+            if self._clear_alpha > 0:
+                # Angular span of this spoke (plus a small margin to avoid gaps)
+                span_deg = abs(az_end - az_start)
+                if span_deg > 180:          # wrapped spoke
+                    span_deg = 360.0 - span_deg
+                span_deg = max(span_deg, 0.5) + 0.5   # at least 1° total
+
+                # Qt drawPie uses 1/16th-degree units; angles from 3-o'clock CCW
+                # We need to convert our North-Up clockwise convention:
+                #   Qt angle = 90 - az_start, span negative (CW)
+                qt_start = int((90.0 - az_start) * 16)
+                qt_span  = int(-span_deg * 16)  # negative = clockwise
+
+                erase_rect = QRectF(
+                    center - center, center - center,
+                    center * 2, center * 2
+                )
+                painter.setCompositionMode(
+                    QPainter.CompositionMode.CompositionMode_SourceOver
+                )
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(0, 0, 0, self._clear_alpha))
+                painter.drawPie(erase_rect, qt_start, qt_span)
+
+            painter.setRenderHint(QPainter.Antialiasing, False)
+
+            # ── Echo cells ─────────────────────────────────────────────────
             n_cells = spoke.nb_cells
             cell_data = spoke.cells
 
@@ -335,6 +503,9 @@ class RadarPPI(QWidget):
                 cell_px = max(1.5, spoke.cell_size_m * px_per_meter)
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QColor(r, g, b, a))
+                painter.setCompositionMode(
+                    QPainter.CompositionMode.CompositionMode_SourceOver
+                )
                 painter.drawEllipse(QPointF(px, py), cell_px / 2, cell_px / 2)
 
             painter.end()
@@ -349,21 +520,6 @@ class RadarPPI(QWidget):
             self._rate_window.popleft()
         self._pkt_rate = len(self._rate_window) / 5.0
 
-        self.update()
-
-    def _apply_fade(self):
-        """Apply persistence decay to the PPI buffer."""
-        if self._ppi_image is None:
-            return
-        # Use QPainter with a semi-transparent black overlay to simulate decay
-        with QMutexLocker(self._mutex):
-            fade_alpha = int((1.0 - self._persistence) * 255)
-            if fade_alpha <= 0:
-                return
-            painter = QPainter(self._ppi_image)
-            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-            painter.fillRect(self._ppi_image.rect(), QColor(0, 0, 0, fade_alpha))
-            painter.end()
         self.update()
 
     def paintEvent(self, event):
@@ -389,7 +545,10 @@ class RadarPPI(QWidget):
             painter.drawImage(int(x_off), int(y_off), img_copy)
 
         # ── Sweep line ───────────────────────────────────────────────────────
-        az_rad = math.radians(self._current_az)
+        az = self._current_az
+        if self._orientation_mode == "North Up" and self._grpc_connected:
+            az = (az + self._own_heading_deg) % 360.0
+        az_rad = math.radians(az)
         sx = cx + radius * math.sin(az_rad)
         sy = cy - radius * math.cos(az_rad)
         sweep_pen = QPen(QColor(0, 255, 0, 80))
@@ -401,9 +560,12 @@ class RadarPPI(QWidget):
         # Draw a fading fan 15 degrees behind the sweep
         for deg_back in range(1, 16):
             alpha = max(0, 60 - deg_back * 4)
-            fan_az = math.radians(self._current_az - deg_back)
-            fan_x = cx + radius * math.sin(fan_az)
-            fan_y = cy - radius * math.cos(fan_az)
+            fan_az = self._current_az - deg_back
+            if self._orientation_mode == "North Up" and self._grpc_connected:
+                fan_az = (fan_az + self._own_heading_deg) % 360.0
+            fan_az_rad = math.radians(fan_az)
+            fan_x = cx + radius * math.sin(fan_az_rad)
+            fan_y = cy - radius * math.cos(fan_az_rad)
             fan_pen = QPen(QColor(0, 200, 0, alpha))
             fan_pen.setWidth(1)
             painter.setPen(fan_pen)
@@ -447,24 +609,34 @@ class RadarPPI(QWidget):
         painter.setPen(border_pen)
         painter.drawEllipse(QPointF(cx, cy), radius, radius)
 
-        # ── Bearing scale (tick marks every 10°, labels every 30°) ──────────
+        # ── Bearing scale (ticks every 5°, major labeled every 30° - rotates with own_heading in Heading Up)
+        scale_offset = 0.0
+        if self._orientation_mode == "Heading Up" and self._grpc_connected:
+            scale_offset = self._own_heading_deg
+
         painter.setFont(QFont("Consolas", 7))
-        for deg in range(0, 360, 10):
-            rad = math.radians(deg)
+        for deg in range(0, 360, 5):
+            screen_deg = (deg - scale_offset) % 360.0
+            rad = math.radians(screen_deg)
             sin_r, cos_r = math.sin(rad), math.cos(rad)
+            
             is_major = (deg % 30 == 0)
-            tick_len = 10 if is_major else 5
-            x1 = cx + (radius) * sin_r
-            y1 = cy - (radius) * cos_r
+            is_medium = (deg % 10 == 0)
+            tick_len = 10 if is_major else (6 if is_medium else 3)
+            
+            x1 = cx + radius * sin_r
+            y1 = cy - radius * cos_r
             x2 = cx + (radius - tick_len) * sin_r
             y2 = cy - (radius - tick_len) * cos_r
-            tick_pen = QPen(QColor(0, 200, 0, 220 if is_major else 120))
+            
+            tick_pen = QPen(QColor(0, 200, 0, 220 if is_major else (120 if is_medium else 60)))
             tick_pen.setWidth(1)
             painter.setPen(tick_pen)
             painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+            
             if is_major:
-                label = str(deg)
-                lx = cx + (radius + 12) * sin_r - 8
+                label = f"{deg:03d}"
+                lx = cx + (radius + 12) * sin_r - 10
                 ly = cy - (radius + 12) * cos_r + 4
                 painter.setPen(QColor(0, 220, 0, 220))
                 painter.drawText(QPointF(lx, ly), label)
@@ -480,6 +652,95 @@ class RadarPPI(QWidget):
         painter.setPen(cross_pen)
         painter.drawLine(QPointF(cx, cy - radius), QPointF(cx, cy + radius))
         painter.drawLine(QPointF(cx - radius, cy), QPointF(cx + radius, cy))
+
+        # ── Standby Overlay ──────────────────────────────────────────────────
+        if self._standby:
+            painter.setFont(QFont("Consolas", 28, QFont.Bold))
+            painter.setPen(QColor(0, 180, 0, 220))
+            fm = painter.fontMetrics()
+            text = "STANDBY"
+            tw = fm.horizontalAdvance(text)
+            th = fm.height()
+            painter.drawText(QPointF(cx - tw / 2.0, cy + th / 4.0), text)
+
+        # ── Plotting Tools Overlays ──────────────────────────────────────────
+        # EBL (rotated with scale_offset to keep true bearing alignment)
+        if self._ebl_enabled:
+            ebl_rad = math.radians(self._ebl_bearing - scale_offset)
+            ebl_x = cx + radius * math.sin(ebl_rad)
+            ebl_y = cy - radius * math.cos(ebl_rad)
+            ebl_pen = QPen(QColor(0, 255, 255, 180), 1.5, Qt.DashLine)
+            painter.setPen(ebl_pen)
+            painter.drawLine(QPointF(cx, cy), QPointF(ebl_x, ebl_y))
+            
+            # Bearing label at the outer end
+            painter.setPen(QColor(0, 255, 255, 220))
+            painter.setFont(QFont("Consolas", 8, QFont.Bold))
+            label_x = cx + (radius + 15) * math.sin(ebl_rad) - 15
+            label_y = cy - (radius + 15) * math.cos(ebl_rad) + 5
+            painter.drawText(QPointF(label_x, label_y), f"{self._ebl_bearing:03d}°")
+
+            # PI Lines (drawn only when EBL is enabled)
+            if self._pi_enabled and self._pi_offset_nm > 0:
+                ux = math.sin(ebl_rad)
+                uy = -math.cos(ebl_rad)
+                vx = math.cos(ebl_rad)
+                vy = math.sin(ebl_rad)
+                
+                px_per_nm = radius / (self._range_m / NM_TO_METERS)
+                D = self._pi_offset_nm * px_per_nm
+                
+                if D < radius:
+                    half_len = math.sqrt(radius**2 - D**2)
+                    pi_pen = QPen(QColor(255, 165, 0, 150), 1.0, Qt.DashLine)
+                    painter.setPen(pi_pen)
+                    
+                    # Right line
+                    rx1 = cx + D * vx - half_len * ux
+                    ry1 = cy + D * vy - half_len * uy
+                    rx2 = cx + D * vx + half_len * ux
+                    ry2 = cy + D * vy + half_len * uy
+                    painter.drawLine(QPointF(rx1, ry1), QPointF(rx2, ry2))
+                    
+                    # Left line
+                    lx1 = cx - D * vx - half_len * ux
+                    ly1 = cy - D * vy - half_len * uy
+                    lx2 = cx - D * vx + half_len * ux
+                    ly2 = cy - D * vy + half_len * uy
+                    painter.drawLine(QPointF(lx1, ly1), QPointF(lx2, ly2))
+
+        # VRM
+        if self._vrm_enabled:
+            px_per_nm = radius / (self._range_m / NM_TO_METERS)
+            vrm_radius = self._vrm_range_nm * px_per_nm
+            if vrm_radius < radius:
+                vrm_pen = QPen(QColor(255, 0, 255, 180), 1.5, Qt.DashLine)
+                painter.setPen(vrm_pen)
+                painter.setBrush(Qt.NoBrush)
+                painter.drawEllipse(QPointF(cx, cy), vrm_radius, vrm_radius)
+                
+                # Range label at 090° position
+                painter.setPen(QColor(255, 0, 255, 220))
+                painter.setFont(QFont("Consolas", 8, QFont.Bold))
+                label_x = cx + vrm_radius + 5
+                if label_x + 40 > cx + radius:
+                    label_x = cx + vrm_radius - 45
+                label_y = cy + 4
+                painter.drawText(QPointF(label_x, label_y), f"{self._vrm_range_nm:.2f} NM")
+
+        # ── Orientation Overlay (top left) ───────────────────────────────────
+        painter.setFont(QFont("Consolas", 10, QFont.Bold))
+        if self._orientation_mode == "North Up" and not self._grpc_connected:
+            painter.setPen(QColor(255, 100, 0, 220))  # Warning orange color
+            mode_text = "MODE: NORTH UP (FALLBACK: HU)"
+            hdg_text = "HDG: ---.-° (NO gRPC)"
+        else:
+            painter.setPen(QColor(0, 255, 0, 220))
+            mode_text = f"MODE: {self._orientation_mode.upper()}"
+            hdg_text = f"HDG: {self._own_heading_deg:.1f}°" if self._grpc_connected else "HDG: ---.-° (HU)"
+        
+        painter.drawText(QPointF(cx - radius + 15, cy - radius + 25), mode_text)
+        painter.drawText(QPointF(cx - radius + 15, cy - radius + 40), hdg_text)
 
         # ── Status overlay (bottom left) ──────────────────────────────────────
         painter.setFont(QFont("Consolas", 8))
@@ -497,6 +758,50 @@ class RadarPPI(QWidget):
 
 # ─── gRPC Radar Control ────────────────────────────────────────────────────────
 
+# ─── versioning ───────────────────────────────────────────────────────────────
+__version__ = "2.1.0"
+
+
+def _find_proto_dir():
+    if getattr(sys, "frozen", False):
+        base = sys._MEIPASS
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    
+    # Candidate list
+    candidates = [
+        os.path.join(base, "proto_extracted"),
+        os.path.join(os.path.dirname(base), "proto_extracted"),
+        os.path.join(os.path.dirname(base), "NMEA Bridge", "proto_extracted"),
+        os.path.join(os.path.dirname(os.path.dirname(base)), "proto_extracted"),
+        os.path.join(os.path.dirname(os.path.dirname(base)), "NMEA Bridge", "proto_extracted"),
+    ]
+    for cand in candidates:
+        if os.path.exists(cand) and os.path.isdir(cand):
+            return cand
+            
+    # Search sibling recursively up to 3 levels
+    p = base
+    for _ in range(3):
+        if not p:
+            break
+        try:
+            for entry in os.listdir(p):
+                full = os.path.join(p, entry)
+                if os.path.isdir(full):
+                    if entry == "proto_extracted":
+                        return full
+                    sub = os.path.join(full, "proto_extracted")
+                    if os.path.isdir(sub):
+                        return sub
+        except Exception:
+            pass
+        p = os.path.dirname(p)
+    return os.path.join(base, "proto_extracted")
+
+
+# ─── gRPC Radar Control ────────────────────────────────────────────────────────
+
 class RadarController:
     """Thin wrapper around the NAUTIS gRPC interface for radar controls."""
 
@@ -506,18 +811,28 @@ class RadarController:
         self._channel = None
         self._classes = {}
         self._radar_entity_id = None
-        cur_dir = os.path.dirname(os.path.abspath(__file__))
-        self._pb_dir = os.path.join(cur_dir, "proto_extracted")
-        if not os.path.exists(self._pb_dir):
-            self._pb_dir = os.path.join(os.path.dirname(cur_dir), "proto_extracted")
+        self._pb_dir = _find_proto_dir()
         self._connected = False
 
-    def connect(self):
+    def close(self):
+        """Cleanly shut down the gRPC channel so its C threads stop."""
+        self._connected = False
+        if self._channel is not None:
+            try:
+                self._channel.close()
+            except Exception:
+                pass
+            self._channel = None
+
+    def connect(self) -> tuple[bool, str]:
         """Load proto descriptors and establish gRPC channel."""
         try:
             import grpc
             from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
             from google.protobuf import any_pb2, timestamp_pb2, duration_pb2
+
+            if not os.path.exists(self._pb_dir):
+                return False, f"Descriptor directory not found: {self._pb_dir}"
 
             pool = descriptor_pool.Default()
 
@@ -580,6 +895,10 @@ class RadarController:
                 "vstep.radar.ClutterParams",
                 "vstep.radar.OperationState",
                 "vstep.radar.OperationParams",
+                "vstep.sensors.CompassBaseOutput",
+                "vstep.viewports.AssignedCamera",
+                "vstep.entities.Relations",
+                "vstep.equipment.MMSI",
             ]
             classes = {}
             for t in needed:
@@ -591,19 +910,28 @@ class RadarController:
 
             self._classes = classes
             self._channel = grpc.insecure_channel(f"{self._host}:{self._port}")
+
+            # Do NOT use channel_ready_future — it spawns a gRPC C polling thread
+            # (_poll_connectivity) that causes an access violation on Python 3.14
+            # at process exit. Connectivity is implicitly tested by the
+            # _find_radar_entity() RPC call made immediately after connect() returns.
             self._connected = True
-            return True
+            return True, "Success"
         except Exception as e:
-            print(f"[radar_ctrl] Connect failed: {e}")
             self._connected = False
-            return False
+            return False, str(e)
+
+    def _ensure_radar_entity(self) -> bool:
+        if self._radar_entity_id is not None:
+            return True
+        self._radar_entity_id = self._find_radar_entity()
+        return self._radar_entity_id is not None
 
     def _find_radar_entity(self) -> int | None:
         """Use GetComponents to find the first entity with RadarParams."""
         if not self._connected or "vstep.radar.RadarParams" not in self._classes:
             return None
         try:
-            import grpc
             sel = self._classes["vstep.entities.EntitySelection"]()
             sel.all_root_entities.CopyFrom(self._classes["vstep.entities.AllRootEntities"]())
             sel.recursion = 99
@@ -613,17 +941,177 @@ class RadarController:
             query.entities.append(sel)
 
             req = self._classes["vstep.entities.GetComponentsRequest"]()
+            req.queries.append(query)
 
-            get_stub = self._channel.unary_stream(
+            get_stub = self._channel.unary_unary(
                 "/vstep.entities.Registry/GetComponents",
                 request_serializer=lambda m: m.SerializeToString(),
                 response_deserializer=self._classes["vstep.entities.GetComponentsResponse"].FromString,
             )
-            for resp in get_stub(req):
-                for comp in resp.components:
-                    return comp.entity_id
+            resp = get_stub(req)
+            for comp in resp.data:
+                url = comp.data.type_url
+                tn = url.split("/")[-1] if "/" in url else url
+                if tn == "RadarParams":
+                    return comp.entity.id
         except Exception as e:
             print(f"[radar_ctrl] Find entity failed: {e}")
+        return None
+
+    def _grpc_get(self, component_type: str):
+        """Query registry for a component type and return the one matching our radar entity."""
+        if not self._connected or not self._ensure_radar_entity():
+            return None
+        if component_type not in self._classes:
+            return None
+        try:
+            sel = self._classes["vstep.entities.EntitySelection"]()
+            sel.all_root_entities.CopyFrom(self._classes["vstep.entities.AllRootEntities"]())
+            sel.recursion = 99
+
+            query = self._classes["vstep.entities.GetComponentsRequest.Query"]()
+            query.component_types.append(component_type)
+            query.entities.append(sel)
+
+            req = self._classes["vstep.entities.GetComponentsRequest"]()
+            req.queries.append(query)
+
+            get_stub = self._channel.unary_unary(
+                "/vstep.entities.Registry/GetComponents",
+                request_serializer=lambda m: m.SerializeToString(),
+                response_deserializer=self._classes["vstep.entities.GetComponentsResponse"].FromString,
+            )
+            resp = get_stub(req)
+            for comp in resp.data:
+                eid = comp.entity.id
+                if eid == self._radar_entity_id:
+                    url = comp.data.type_url
+                    tn = url.split("/")[-1] if "/" in url else url
+                    if component_type.endswith(tn):
+                        msg = self._classes[component_type]()
+                        msg.MergeFromString(comp.data.value)
+                        return msg
+        except Exception as e:
+            print(f"[radar_ctrl] _grpc_get failed for {component_type}: {e}")
+        return None
+
+    def get_heading(self) -> float | None:
+        """Get the own-ship heading in degrees from the simulator."""
+        if not self._connected:
+            return None
+        try:
+            needed_types = [
+                "vstep.sensors.CompassBaseOutput",
+                "vstep.viewports.AssignedCamera",
+                "vstep.entities.Relations",
+                "vstep.equipment.MMSI"
+            ]
+            for t in needed_types:
+                if t not in self._classes:
+                    return None
+
+            sel = self._classes["vstep.entities.EntitySelection"]()
+            sel.all_root_entities.CopyFrom(self._classes["vstep.entities.AllRootEntities"]())
+            sel.recursion = 99
+
+            query = self._classes["vstep.entities.GetComponentsRequest.Query"]()
+            for t in needed_types:
+                query.component_types.append(t)
+            query.entities.append(sel)
+
+            req = self._classes["vstep.entities.GetComponentsRequest"]()
+            req.queries.append(query)
+
+            get_stub = self._channel.unary_unary(
+                "/vstep.entities.Registry/GetComponents",
+                request_serializer=lambda m: m.SerializeToString(),
+                response_deserializer=self._classes["vstep.entities.GetComponentsResponse"].FromString,
+            )
+            resp = get_stub(req)
+
+            entities = {}
+            for comp in resp.data:
+                url = comp.data.type_url
+                tn = url.split("/")[-1] if "/" in url else url
+                eid = comp.entity.id
+                if eid not in entities:
+                    entities[eid] = {}
+                full_tn = f"vstep.sensors.{tn}" if tn == "CompassBaseOutput" else (
+                    f"vstep.viewports.{tn}" if tn == "AssignedCamera" else (
+                        f"vstep.entities.{tn}" if tn in ("Relations", "Name", "DisplayName") else (
+                            f"vstep.equipment.{tn}" if tn == "MMSI" else tn
+                        )
+                    )
+                )
+                entities[eid][tn] = comp.data
+                entities[eid][full_tn] = comp.data
+
+            parsed_entities = {}
+            for eid, comps in entities.items():
+                parsed_entities[eid] = {}
+                for key, any_msg in comps.items():
+                    for t in needed_types:
+                        if t.endswith(key) or key == t:
+                            try:
+                                msg = self._classes[t]()
+                                msg.MergeFromString(any_msg.value)
+                                parsed_entities[eid][t] = msg
+                            except Exception:
+                                pass
+
+            own_ship_eid = None
+            camera_eid = None
+            for eid, comps in parsed_entities.items():
+                if "vstep.viewports.AssignedCamera" in comps:
+                    camera_eid = comps["vstep.viewports.AssignedCamera"].entity
+                    break
+
+            parent_map = {}
+            for eid, comps in parsed_entities.items():
+                rel = comps.get("vstep.entities.Relations")
+                if rel:
+                    for child in rel.children:
+                        parent_map[child] = eid
+
+            if camera_eid:
+                curr = camera_eid
+                path = []
+                while True:
+                    parent = parent_map.get(curr)
+                    if parent:
+                        path.append(parent)
+                        curr = parent
+                    else:
+                        break
+                for peid in path:
+                    if peid in parsed_entities and "vstep.equipment.MMSI" in parsed_entities[peid]:
+                        own_ship_eid = peid
+                        break
+
+            if own_ship_eid is not None:
+                descendants = set()
+                to_visit = [own_ship_eid]
+                while to_visit:
+                    curr = to_visit.pop()
+                    if curr != own_ship_eid:
+                        descendants.add(curr)
+                    rel = parsed_entities.get(curr, {}).get("vstep.entities.Relations")
+                    if rel:
+                        for child in rel.children:
+                            if child not in descendants and child != own_ship_eid:
+                                to_visit.append(child)
+
+                for eid in [own_ship_eid] + list(descendants):
+                    if eid in parsed_entities and "vstep.sensors.CompassBaseOutput" in parsed_entities[eid]:
+                        compass = parsed_entities[eid]["vstep.sensors.CompassBaseOutput"]
+                        return math.degrees(compass.heading) % 360.0
+
+            for eid, comps in parsed_entities.items():
+                if "vstep.sensors.CompassBaseOutput" in comps:
+                    compass = comps["vstep.sensors.CompassBaseOutput"]
+                    return math.degrees(compass.heading) % 360.0
+        except Exception as e:
+            print(f"[radar_ctrl] get_heading failed: {e}")
         return None
 
     def _set_component(self, entity_id: int, component_msg):
@@ -631,14 +1119,12 @@ class RadarController:
         if not self._connected:
             return False
         try:
-            from google.protobuf import any_pb2
-
             comp_data = self._classes["vstep.entities.ComponentData"]()
-            comp_data.entity_id = entity_id
+            comp_data.entity.id = entity_id
             comp_data.data.Pack(component_msg)
 
             req = self._classes["vstep.entities.SetComponentsRequest"]()
-            req.components.append(comp_data)
+            req.data.append(comp_data)
 
             set_stub = self._channel.unary_unary(
                 "/vstep.entities.Registry/SetComponents",
@@ -655,9 +1141,7 @@ class RadarController:
         """Set radar gain (0.0–1.0 normalised)."""
         if "vstep.radar.RadarParams" not in self._classes:
             return
-        if self._radar_entity_id is None:
-            self._radar_entity_id = self._find_radar_entity()
-        if self._radar_entity_id is None:
+        if not self._ensure_radar_entity():
             return
         params = self._classes["vstep.radar.RadarParams"]()
         params.gain = gain_norm
@@ -667,9 +1151,7 @@ class RadarController:
         """Set sea clutter filter strength (0.0–1.0)."""
         if "vstep.radar.ClutterParams" not in self._classes:
             return
-        if self._radar_entity_id is None:
-            self._radar_entity_id = self._find_radar_entity()
-        if self._radar_entity_id is None:
+        if not self._ensure_radar_entity():
             return
         params = self._classes["vstep.radar.ClutterParams"]()
         params.sea_filter_strength = strength
@@ -679,9 +1161,7 @@ class RadarController:
         """Set rain clutter filter strength (0.0–1.0)."""
         if "vstep.radar.ClutterParams" not in self._classes:
             return
-        if self._radar_entity_id is None:
-            self._radar_entity_id = self._find_radar_entity()
-        if self._radar_entity_id is None:
+        if not self._ensure_radar_entity():
             return
         params = self._classes["vstep.radar.ClutterParams"]()
         params.rain_filter_strength = strength
@@ -691,9 +1171,7 @@ class RadarController:
         """Enable/disable radar transmit (render_enabled)."""
         if "vstep.radar.OperationState" not in self._classes:
             return
-        if self._radar_entity_id is None:
-            self._radar_entity_id = self._find_radar_entity()
-        if self._radar_entity_id is None:
+        if not self._ensure_radar_entity():
             return
         state = self._classes["vstep.radar.OperationState"]()
         state.render_enabled = enabled
@@ -703,32 +1181,63 @@ class RadarController:
 # ─── Connection Settings Dialog ───────────────────────────────────────────────
 
 class ConnectionDialog(QDialog):
-    def __init__(self, udp_port: int, grpc_host: str, grpc_port: int, parent=None):
+    def __init__(self, udp_port: int, grpc_host: str, grpc_port: int,
+                 splitter_enabled: bool, splitter_port: int, splitter_forward: bool, splitter_remotes: str,
+                 parent=None):
         super().__init__(parent)
         self.setWindowTitle("Connection Settings")
-        self.setMinimumWidth(350)
+        self.setMinimumWidth(380)
 
-        layout = QFormLayout(self)
+        layout = QVBoxLayout(self)
+
+        # Basic Settings Group
+        basic_group = QGroupBox("Radar Display Settings")
+        basic_layout = QFormLayout(basic_group)
 
         self.udp_port_spin = QSpinBox()
         self.udp_port_spin.setRange(1024, 65535)
         self.udp_port_spin.setValue(udp_port)
-        layout.addRow("UDP Listen Port:", self.udp_port_spin)
+        basic_layout.addRow("Radar Listen Port:", self.udp_port_spin)
 
         self.grpc_host_edit = QLineEdit(grpc_host)
-        layout.addRow("Simulator IP (gRPC):", self.grpc_host_edit)
+        basic_layout.addRow("Simulator IP (gRPC):", self.grpc_host_edit)
 
         self.grpc_port_spin = QSpinBox()
         self.grpc_port_spin.setRange(1024, 65535)
         self.grpc_port_spin.setValue(grpc_port)
-        layout.addRow("Simulator gRPC Port:", self.grpc_port_spin)
+        basic_layout.addRow("Simulator gRPC Port:", self.grpc_port_spin)
+
+        layout.addWidget(basic_group)
+
+        # Splitter Settings Group
+        split_group = QGroupBox("Integrated UDP Splitter (Sim Machine)")
+        split_layout = QFormLayout(split_group)
+
+        self.split_enable_cb = QCheckBox("Enable Background Splitter")
+        self.split_enable_cb.setChecked(splitter_enabled)
+        split_layout.addRow("", self.split_enable_cb)
+
+        self.split_port_spin = QSpinBox()
+        self.split_port_spin.setRange(1024, 65535)
+        self.split_port_spin.setValue(splitter_port)
+        split_layout.addRow("Splitter Listen Port:", self.split_port_spin)
+
+        self.split_forward_cb = QCheckBox("Forward to In-Game Radar")
+        self.split_forward_cb.setChecked(splitter_forward)
+        split_layout.addRow("", self.split_forward_cb)
+
+        self.split_remotes_edit = QLineEdit(splitter_remotes)
+        self.split_remotes_edit.setPlaceholderText("e.g. 192.168.1.50, 192.168.1.51")
+        split_layout.addRow("Remote Display IPs:", self.split_remotes_edit)
+
+        layout.addWidget(split_group)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
+        layout.addWidget(buttons)
 
     @property
     def udp_port(self): return self.udp_port_spin.value()
@@ -736,26 +1245,56 @@ class ConnectionDialog(QDialog):
     def grpc_host(self): return self.grpc_host_edit.text().strip()
     @property
     def grpc_port(self): return self.grpc_port_spin.value()
+    @property
+    def splitter_enabled(self): return self.split_enable_cb.isChecked()
+    @property
+    def splitter_port(self): return self.split_port_spin.value()
+    @property
+    def splitter_forward(self): return self.split_forward_cb.isChecked()
+    @property
+    def splitter_remotes(self): return self.split_remotes_edit.text().strip()
 
 
 # ─── Main Window ──────────────────────────────────────────────────────────────
 
 class RadarMainWindow(QMainWindow):
+    grpc_connected = Signal(bool, str, object)
+    heading_received = Signal(float)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("NAUTIS Standalone Radar Display")
-        self.setMinimumSize(820, 680)
+        self.setMinimumSize(850, 720)
 
+        # Default port 53457 to match NMEA Bridge/sim default for gRPC, and 54322 for UDP
         self._udp_port = 54322
         self._grpc_host = "127.0.0.1"
-        self._grpc_port = 8086
+        self._grpc_port = 53457
+
+        # Splitter settings
+        self._splitter_enabled = True
+        self._splitter_listen_port = 54321
+        self._splitter_forward_ingame = True
+        self._splitter_remote_hosts = ""
+        self._splitter_thread = None
 
         self._controller = RadarController(self._grpc_host, self._grpc_port)
         self._transmitting = True
 
         self._build_ui()
         self._apply_stylesheet()
+        self._ppi.set_standby(False)
         self._start_receiver()
+        self._start_splitter()
+
+        # Heading poll timer (1 Hz)
+        self._heading_timer = QTimer(self)
+        self._heading_timer.setInterval(1000)
+        self._heading_timer.timeout.connect(self._poll_heading)
+
+        # Connect thread-safe signals
+        self.grpc_connected.connect(self._on_grpc_connected_result)
+        self.heading_received.connect(self._ppi.set_heading)
 
     # ── UI Construction ───────────────────────────────────────────────────────
 
@@ -779,7 +1318,7 @@ class RadarMainWindow(QMainWindow):
         panel.setFixedWidth(200)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(8)
+        layout.setSpacing(6)
 
         # ── Title ─────────────────────────────────────────────────────────
         title = QLabel("RADAR")
@@ -787,6 +1326,12 @@ class RadarMainWindow(QMainWindow):
         title.setFont(QFont("Consolas", 18, QFont.Bold))
         title.setStyleSheet("color: #00FF00; letter-spacing: 4px;")
         layout.addWidget(title)
+
+        version_lbl = QLabel(f"v{__version__}")
+        version_lbl.setAlignment(Qt.AlignCenter)
+        version_lbl.setFont(QFont("Consolas", 8))
+        version_lbl.setStyleSheet("color: #006600;")
+        layout.addWidget(version_lbl)
 
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
@@ -818,6 +1363,74 @@ class RadarMainWindow(QMainWindow):
         range_layout.addWidget(self._range_combo)
         layout.addWidget(range_group)
 
+        # ── Orientation ────────────────────────────────────────────────────
+        orient_group = QGroupBox("Orientation")
+        orient_layout = QHBoxLayout(orient_group)
+        self._hu_btn = QPushButton("HU")
+        self._nu_btn = QPushButton("NU")
+        self._hu_btn.setCheckable(True)
+        self._nu_btn.setCheckable(True)
+        self._hu_btn.setChecked(True)
+        self._hu_btn.clicked.connect(self._on_hu)
+        self._nu_btn.clicked.connect(self._on_nu)
+        orient_layout.addWidget(self._hu_btn)
+        orient_layout.addWidget(self._nu_btn)
+        layout.addWidget(orient_group)
+
+        # ── Plotting Tools ─────────────────────────────────────────────────
+        plot_group = QGroupBox("Plotting Tools")
+        plot_layout = QVBoxLayout(plot_group)
+        plot_layout.setSpacing(4)
+        plot_layout.setContentsMargins(4, 4, 4, 4)
+
+        # EBL row
+        ebl_row = QHBoxLayout()
+        self._ebl_btn = QPushButton("EBL")
+        self._ebl_btn.setCheckable(True)
+        self._ebl_btn.clicked.connect(self._on_ebl_toggled)
+        self._ebl_spin = QSpinBox()
+        self._ebl_spin.setRange(0, 359)
+        self._ebl_spin.setSuffix("°")
+        self._ebl_spin.setValue(0)
+        self._ebl_spin.valueChanged.connect(self._on_ebl_val_changed)
+        ebl_row.addWidget(self._ebl_btn, stretch=1)
+        ebl_row.addWidget(self._ebl_spin, stretch=1)
+        plot_layout.addLayout(ebl_row)
+
+        # VRM row
+        vrm_row = QHBoxLayout()
+        self._vrm_btn = QPushButton("VRM")
+        self._vrm_btn.setCheckable(True)
+        self._vrm_btn.clicked.connect(self._on_vrm_toggled)
+        self._vrm_spin = QDoubleSpinBox()
+        self._vrm_spin.setRange(0.05, 24.0)
+        self._vrm_spin.setDecimals(2)
+        self._vrm_spin.setSingleStep(0.1)
+        self._vrm_spin.setSuffix(" NM")
+        self._vrm_spin.setValue(1.0)
+        self._vrm_spin.valueChanged.connect(self._on_vrm_val_changed)
+        vrm_row.addWidget(self._vrm_btn, stretch=1)
+        vrm_row.addWidget(self._vrm_spin, stretch=1)
+        plot_layout.addLayout(vrm_row)
+
+        # Parallel Index (PI) row
+        pi_row = QHBoxLayout()
+        self._pi_btn = QPushButton("PI")
+        self._pi_btn.setCheckable(True)
+        self._pi_btn.clicked.connect(self._on_pi_toggled)
+        self._pi_spin = QDoubleSpinBox()
+        self._pi_spin.setRange(0.01, 5.0)
+        self._pi_spin.setDecimals(2)
+        self._pi_spin.setSingleStep(0.05)
+        self._pi_spin.setSuffix(" NM")
+        self._pi_spin.setValue(0.5)
+        self._pi_spin.valueChanged.connect(self._on_pi_val_changed)
+        pi_row.addWidget(self._pi_btn, stretch=1)
+        pi_row.addWidget(self._pi_spin, stretch=1)
+        plot_layout.addLayout(pi_row)
+
+        layout.addWidget(plot_group)
+
         # ── Gain ───────────────────────────────────────────────────────────
         layout.addWidget(self._make_slider_group("Gain", "gain_slider",
                          0, 200, 100, self._on_gain))
@@ -831,8 +1444,15 @@ class RadarMainWindow(QMainWindow):
                          0, 100, 0, self._on_rain))
 
         # ── Persistence ────────────────────────────────────────────────────
+        def format_persistence(v):
+            if v == 0:   return "Single Sweep"
+            elif v <= 25: return f"Light Ghost ({v})"
+            elif v <= 60: return f"Medium Ghost ({v})"
+            elif v <= 90: return f"Heavy Ghost ({v})"
+            else:         return f"Full Persistence ({v})"
+
         layout.addWidget(self._make_slider_group("Persistence", "persist_slider",
-                         0, 98, 85, self._on_persistence))
+                         0, 100, 0, self._on_persistence, formatter=format_persistence))
 
         layout.addStretch()
 
@@ -860,16 +1480,18 @@ class RadarMainWindow(QMainWindow):
         return panel
 
     def _make_slider_group(self, label: str, attr_name: str, min_v, max_v, default,
-                           callback) -> QGroupBox:
+                           callback, formatter=str) -> QGroupBox:
         group = QGroupBox(label)
         v_layout = QVBoxLayout(group)
+        v_layout.setSpacing(2)
+        v_layout.setContentsMargins(4, 4, 4, 4)
         slider = QSlider(Qt.Horizontal)
         slider.setRange(min_v, max_v)
         slider.setValue(default)
-        val_label = QLabel(f"{default}")
+        val_label = QLabel(formatter(default))
         val_label.setAlignment(Qt.AlignCenter)
         val_label.setFont(QFont("Consolas", 8))
-        slider.valueChanged.connect(lambda v, lbl=val_label: lbl.setText(str(v)))
+        slider.valueChanged.connect(lambda v, lbl=val_label: lbl.setText(formatter(v)))
         slider.valueChanged.connect(callback)
         v_layout.addWidget(slider)
         v_layout.addWidget(val_label)
@@ -939,7 +1561,7 @@ class RadarMainWindow(QMainWindow):
                 selection-background-color: #004400;
             }
             QLabel { color: #00CC00; font-family: Consolas; }
-            QLineEdit, QSpinBox {
+            QLineEdit, QSpinBox, QDoubleSpinBox {
                 background-color: #001800;
                 border: 1px solid #006600;
                 color: #00CC00;
@@ -955,25 +1577,48 @@ class RadarMainWindow(QMainWindow):
 
     # ── Signal Handlers ───────────────────────────────────────────────────────
 
+    def _on_hu(self):
+        self._hu_btn.setChecked(True)
+        self._nu_btn.setChecked(False)
+        self._ppi.set_orientation_mode("Heading Up")
+
+    def _on_nu(self):
+        self._hu_btn.setChecked(False)
+        self._nu_btn.setChecked(True)
+        self._ppi.set_orientation_mode("North Up")
+        if not self._controller._connected:
+            self._status_label.setText("North Up requires gRPC!")
+            self._status_label.setStyleSheet("color: #FF8800;")
+
+    def _on_ebl_toggled(self, checked: bool):
+        self._ppi.set_ebl_enabled(checked)
+
+    def _on_ebl_val_changed(self, val: int):
+        self._ppi.set_ebl_bearing(val)
+
+    def _on_vrm_toggled(self, checked: bool):
+        self._ppi.set_vrm_enabled(checked)
+
+    def _on_vrm_val_changed(self, val: float):
+        self._ppi.set_vrm_range_nm(val)
+
+    def _on_pi_toggled(self, checked: bool):
+        self._ppi.set_pi_enabled(checked)
+
+    def _on_pi_val_changed(self, val: float):
+        self._ppi.set_pi_offset_nm(val)
+
     def _on_tx(self):
         self._transmitting = True
         self._tx_btn.setChecked(True)
         self._stby_btn.setChecked(False)
-        if self._controller._connected:
-            threading.Thread(
-                target=self._controller.set_transmit,
-                args=(True,), daemon=True
-            ).start()
+        self._ppi.set_standby(False)
 
     def _on_stby(self):
         self._transmitting = False
         self._stby_btn.setChecked(True)
         self._tx_btn.setChecked(False)
-        if self._controller._connected:
-            threading.Thread(
-                target=self._controller.set_transmit,
-                args=(False,), daemon=True
-            ).start()
+        self._ppi.set_standby(True)
 
     def _on_range_changed(self, index: int):
         range_m = RANGE_OPTIONS_NM[index] * NM_TO_METERS
@@ -982,64 +1627,101 @@ class RadarMainWindow(QMainWindow):
     def _on_gain(self, value: int):
         gain = value / 100.0  # 0–2.0
         self._ppi.set_gain(gain)
-        if self._controller._connected:
-            threading.Thread(
-                target=self._controller.set_gain,
-                args=(value / 200.0,), daemon=True
-            ).start()
 
     def _on_sea(self, value: int):
-        if self._controller._connected:
-            threading.Thread(
-                target=self._controller.set_sea_clutter,
-                args=(value / 100.0,), daemon=True
-            ).start()
+        pass
 
     def _on_rain(self, value: int):
-        if self._controller._connected:
-            threading.Thread(
-                target=self._controller.set_rain_clutter,
-                args=(value / 100.0,), daemon=True
-            ).start()
+        pass
 
     def _on_persistence(self, value: int):
-        self._ppi.set_persistence(value / 100.0)
+        self._ppi.set_persistence(value)
 
     def _on_connection_settings(self):
         dlg = ConnectionDialog(
-            self._udp_port, self._grpc_host, self._grpc_port, self
+            self._udp_port, self._grpc_host, self._grpc_port,
+            self._splitter_enabled, self._splitter_listen_port,
+            self._splitter_forward_ingame, self._splitter_remote_hosts,
+            self
         )
         if dlg.exec() == QDialog.Accepted:
             self._udp_port = dlg.udp_port
             self._grpc_host = dlg.grpc_host
             self._grpc_port = dlg.grpc_port
-            # Restart receiver with new port
+            self._splitter_enabled = dlg.splitter_enabled
+            self._splitter_listen_port = dlg.splitter_port
+            self._splitter_forward_ingame = dlg.splitter_forward
+            self._splitter_remote_hosts = dlg.splitter_remotes
+
+            # Restart receiver with new port (non-blocking)
             self._receiver.stop()
-            self._receiver.wait(2000)
-            self._receiver.set_port(self._udp_port)
+            self._receiver = AsterixReceiver(self._udp_port)
+            self._receiver.spoke_received.connect(self._ppi.add_spoke)
+            self._receiver.status_changed.connect(self._on_status_changed)
             self._receiver.start()
-            self._status_label.setText(f"Restarting on port {self._udp_port}...")
+
+            # Restart splitter
+            self._start_splitter()
+
+            self._status_label.setText(f"Restarting...")
 
     def _on_connect_grpc(self):
-        self._controller = RadarController(self._grpc_host, self._grpc_port)
+        # Stop heading polling first so the old channel isn't used mid-close
+        self._heading_timer.stop()
         self._status_label.setText("Connecting gRPC...")
+        self._status_label.setStyleSheet("color: #AAAAAA;")
+
+        old_controller = self._controller
+        new_host = self._grpc_host
+        new_port = self._grpc_port
+
         def _do_connect():
-            ok = self._controller.connect()
-            if ok:
-                eid = self._controller._find_radar_entity()
-                self._controller._radar_entity_id = eid
-                if eid is not None:
-                    self._status_label.setText(
-                        f"gRPC OK\nRadar entity: {eid}"
-                    )
-                    self._status_label.setStyleSheet("color: #00FF00;")
-                else:
-                    self._status_label.setText("gRPC OK\nNo radar entity found")
-                    self._status_label.setStyleSheet("color: #AAAA00;")
-            else:
-                self._status_label.setText("gRPC FAILED")
-                self._status_label.setStyleSheet("color: #FF4400;")
+            # Cleanly close the old channel first; give gRPC C threads 300 ms to drain
+            try:
+                old_controller.close()
+            except Exception:
+                pass
+            time.sleep(0.35)
+
+            # Build a fresh controller
+            ctrl = RadarController(new_host, new_port)
+            ok, msg = ctrl.connect()
+
+            # Hand the new controller to the main thread via signal
+            self.grpc_connected.emit(ok, msg, None)
+            # Store it here too so the main-thread handler can pick it up
+            self._pending_controller = ctrl if ok else None
+
         threading.Thread(target=_do_connect, daemon=True).start()
+
+    def _on_grpc_connected_result(self, ok: bool, msg: str, eid):
+        # Swap in the new controller if connection succeeded
+        if ok and getattr(self, '_pending_controller', None) is not None:
+            self._controller = self._pending_controller
+        self._pending_controller = None
+
+        self._ppi.set_grpc_connected(ok)
+        if ok:
+            self._status_label.setText("gRPC OK\nHeading active")
+            self._status_label.setStyleSheet("color: #00FF00;")
+            self._heading_timer.start()
+        else:
+            self._status_label.setText(f"Connection failed:\n{msg}")
+            self._status_label.setStyleSheet("color: #FF4400;")
+
+    def _poll_heading(self):
+        """Poll simulator for own-ship heading in a background thread."""
+        if not self._controller._connected:
+            self._heading_timer.stop()
+            self._ppi.set_grpc_connected(False)
+            return
+
+        def _do_poll():
+            hdg = self._controller.get_heading()
+            if hdg is not None:
+                self.heading_received.emit(hdg)
+
+        threading.Thread(target=_do_poll, daemon=True).start()
 
     def _on_status_changed(self, msg: str):
         self._status_label.setText(msg)
@@ -1052,9 +1734,39 @@ class RadarMainWindow(QMainWindow):
         self._receiver.status_changed.connect(self._on_status_changed)
         self._receiver.start()
 
+    def _start_splitter(self):
+        if self._splitter_thread:
+            self._splitter_thread.stop()
+            self._splitter_thread.wait(2000)
+            self._splitter_thread = None
+        
+        if self._splitter_enabled:
+            hosts = [h.strip() for h in self._splitter_remote_hosts.split(",") if h.strip()]
+            display_hosts = ["127.0.0.1"] + hosts
+            self._splitter_thread = RadarSplitterThread(
+                listen_port=self._splitter_listen_port,
+                ingame_port=44444,
+                display_hosts=display_hosts,
+                display_port=self._udp_port,
+                forward_ingame=self._splitter_forward_ingame
+            )
+            self._splitter_thread.status_changed.connect(self._on_splitter_status)
+            self._splitter_thread.start()
+
+    def _on_splitter_status(self, msg: str):
+        print(f"[Splitter] {msg}")
+
     def closeEvent(self, event):
+        self._heading_timer.stop()
         self._receiver.stop()
         self._receiver.wait(3000)
+        if self._splitter_thread:
+            self._splitter_thread.stop()
+            self._splitter_thread.wait(2000)
+        try:
+            self._controller.close()
+        except Exception:
+            pass
         super().closeEvent(event)
 
 

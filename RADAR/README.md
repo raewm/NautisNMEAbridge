@@ -11,30 +11,46 @@ This project provides a standalone, high-performance radar display application f
                                    │
                                    │ (UDP ASTERIX Cat 240 on Port 54321)
                                    ▼
-                        [ run_nautis_radar.py ]
-                          (Launcher / Splitter)
-                            │                │
-       (Local loopback on 44444)            │ (Network UDP on 54322)
-                            ▼                ▼
-                   [ In-Game Radar ]   [ Standalone Radar Display ]
-                                          (radar_display.py)
-                                             │
-                                             │ (gRPC Control on Port 8086)
-                                             ▼
-                                       [ NMEA Bridge / Sim ]
+                       [ Radar Display (Splitter) ]
+                             │                │
+        (Local loopback on 44444)            │ (Internal UDP on 54322)
+                             ▼                ▼
+                    [ In-Game Radar ]   [ Radar Display (Receiver) ]
+                                              │
+                                              │ (gRPC Control on Port 53457)
+                                              ▼
+                                     [ NMEA Bridge / Sim ]
 ```
 
 1. **ASTERIX Stream**: The simulator's ExtCommunication engine outputs raw radar sweep data as standard EUROCONTROL ASTERIX Cat 240 packets.
 2. **Port Routing**: By default, NAUTIS outputs to port `44444`. To intercept the stream without disabling the in-game display, we configure the simulator to send to `54321`.
-3. **Splitter & Launcher (`run_nautis_radar.py`)**: A lightweight launcher binds to `54321` on the simulator machine. It forwards the packets to `127.0.0.1:44444` (so the in-game radar works) and duplicates the stream to target computers.
-4. **Standalone Display (`radar_display.py`)**: A PySide6 (Qt) application that listens on UDP port `54322` (locally or remotely), decodes the Cat 240 packets, and draws a Plan Position Indicator (PPI) sweep screen with persistence/afterglow.
+3. **Integrated Splitter**: A background thread inside the standalone display binds to `54321` on the simulator machine. It forwards the packets to `127.0.0.1:44444` (so the in-game radar works) and routes the stream to target displays.
+4. **Standalone Display (`radar_display.py` / `dist/radar_display.exe`)**: A PySide6 (Qt) application that listens on UDP port `54322` (locally or remotely), decodes the Cat 240 packets, and draws a Plan Position Indicator (PPI) sweep screen with persistence/afterglow.
+
+---
+
+## Port Allocation & Compatibility
+
+The RADAR tools use the following port layout:
+
+| Program | Port | Protocol | Direction | Purpose |
+|---------|------|----------|-----------|---------|
+| NAUTIS Simulator | 53457 | gRPC | Inbound | Registry API |
+| Radar Display (Splitter) | 54321 | UDP | Inbound | Intercept ASTERIX Cat 240 stream from sim |
+| In-Game Radar | 44444 | UDP | Inbound | In-game display (forwarded by splitter) |
+| Radar Display (Receiver) | 54322 | UDP | Inbound | Receive spokes (forwarded by splitter) |
+| Radar Display | 53457 | gRPC | Outbound | Connect as client to poll own-ship heading |
+
+### No Port Conflicts
+- Multiple gRPC clients (like both the **Radar Display** and the **NMEA Bridge**) can connect to the simulator's gRPC server on port `53457` simultaneously without conflict.
+- The **Radar Display** binds ONLY to UDP port `54322` to receive packets, avoiding any conflict with the simulator or other mods.
 
 ---
 
 ## File Layout
 
-- **`radar_splitter.py`**: The raw UDP splitter. Listens on port `54321`, forwards to the in-game radar (`44444`) and the standalone display (`54322`).
-- **`radar_display.py`**: The PySide6 standalone radar display client.
+- **`radar_display.py`** (and `dist/radar_display.exe`): The PySide6 standalone radar display client, which includes the integrated UDP splitter thread.
+- **`proto_extracted/`**: Directory containing the protobuf descriptors (`.proto.pb` files) extracted from the simulator. This folder is required for all gRPC controls (Gain, Clutters, TX toggle) and the North Up orientation mode.
 
 ---
 
@@ -67,55 +83,78 @@ Leave `<_remoteIP>` set to `127.0.0.1` — do not change it.
 
 > **This is the only simulator-side file you need to modify.** In particular, `ExtCommunication.DataProvider.Settings.settings` does **not** need to be changed — that file relates to an unrelated NAUTIS TCP data service and is not used by this project.
 
-### 2. Install Dependencies (Display Computer)
-Ensure you have Python 3 installed. Install the following libraries:
+### 2. Install Dependencies (If running script)
+If running `radar_display.py` directly (rather than the standalone executable), ensure you have Python 3 installed and run:
 ```bash
 pip install PySide6 grpcio protobuf
 ```
 
 ---
 
-## Execution Guide
+## Standalone Executable
 
-### Scenario A: Running on a Remote Computer (Recommended)
-1. **On the Simulator Computer** — start the splitter and point it at the remote IP:
-   ```bash
-   python radar_splitter.py --display <remote-computer-ip>
-   ```
-   *(e.g., `python radar_splitter.py --display 192.168.1.50`)*
-   *(This forwards to port 54322 on the remote machine by default).*
+A pre-built Windows executable is available at `dist/radar_display.exe`. It bundles the Python runtime, PySide6 GUI library, and the required protobuf schemas.
 
-2. **On the Remote Computer** — start the standalone display:
-   ```bash
-   python radar_display.py
-   ```
-   *(This listens on port 54322 by default.)*
+### Distribution
+Only `dist/radar_display.exe` needs to be distributed. You can copy it to any display computer or run it on the simulator machine.
 
-### Scenario B: Running on the Same Computer (Default)
-1. **Start the Splitter**:
-   ```bash
-   python radar_splitter.py
-   ```
-   *(Listens on port 54321, forwards to in-game radar on 44444 and standalone display on 54322.)*
-2. **Start the Display**:
-   ```bash
-   python radar_display.py
-   ```
-   *(Listens on port 54322. No additional configuration needed.)*
+### Rebuilding the Executable
+If you modify `radar_display.py`, you can rebuild the executable using PyInstaller:
+```powershell
+pyinstaller --clean --noconsole --onefile --add-data "proto_extracted;proto_extracted" radar_display.py
+```
 
 ---
 
-## Control Panel & gRPC Integration
+## Execution Guide
+
+The application can be run in two ways: using the pre-built standalone executable (`dist/radar_display.exe`) or the Python script (`radar_display.py`).
+
+### Scenario A: Running on the Same Computer (Default & Single-Machine)
+Since the UDP Splitter is integrated directly as a background thread:
+1. **Launch the Display**:
+   - Double-click `dist/radar_display.exe` (or run `python radar_display.py`).
+2. **That's it!**
+   - The integrated splitter starts automatically, listening on port `54321` and forwarding packets to the in-game radar on `44444` and the local receiver on `54322`. No extra scripts or configurations are needed.
+
+### Scenario B: Running on a Remote Display Computer
+If your radar display is on a separate computer:
+1. **On the Simulator Computer**:
+   - Run `dist/radar_display.exe` (or `python radar_display.py`).
+   - Open **Connection Settings** (bottom of the sidebar).
+   - Check **Enable Background Splitter**.
+   - In **Remote Display IPs**, enter your remote display computer's IP address (e.g., `192.168.1.50`).
+   - Click **OK**.
+2. **On the Remote Display Computer**:
+   - Run `dist/radar_display.exe` (or `python radar_display.py`).
+   - Open **Connection Settings**.
+   - **Uncheck** "Enable Background Splitter" (since the splitter is running on the sim machine).
+   - Click **OK**.
+
+---
+
+## Control Panel, Orientation & Plotting Tools
 
 The standalone display contains interactive controls in the sidebar:
-- **Range Selector**: Adjusts the scale (0.25 NM to 24 NM).
-- **Gain, Sea Clutter, Rain Clutter, Persistence**: Adjustable sliders.
 - **TX / STBY**: Toggles between radar transmit and standby modes.
+- **Range Selector**: Adjusts the scale (0.25 NM to 24 NM).
+- **Orientation Mode**: 
+  - **HU (Heading Up)**: Ship's bow is always at the top of the display.
+  - **NU (North Up)**: Geographically stabilized display with North at the top. Requires gRPC connection to feed own-ship compass heading.
+- **Plotting Tools**:
+  - **EBL (Electronic Bearing Line)**: A dashed bearing line with an outer bearing label. Adjust with spin box.
+  - **VRM (Variable Range Marker)**: A dashed range circle with range labels. Adjust with spin box.
+  - **PI (Parallel Index Lines)**: Offset index lines parallel to the EBL for clearing distance checks.
+- **Gain, Sea Clutter, Rain Clutter**: Adjusts radar sensitivity and clutter filtering.
+- **Persistence**: Slider to adjust phosphor screen afterglow length (from Short/Medium/Long to Infinite).
 
-### Linking Controls to the Simulator:
+### gRPC Heading Integration:
 1. Press the **Connect gRPC** button in the sidebar.
-2. Enter the IP of your simulator computer and the gRPC port (`8086` if using the NMEA Bridge).
-3. Once connected, changes made to the sidebar controls (Gain, Clutters, TX/STBY) will be transmitted back to the simulator in real-time, syncing the state of the radar.
+2. Enter the IP of your simulator computer and the gRPC port (`53457` by default).
+3. Once connected, the own-ship heading will poll at 1 Hz to enable **North Up (NU)** mode.
+
+> [!NOTE]
+> **Local Control Separation:** Standby/Transmit toggles, Gain, Sea Clutter, and Rain Clutter controls are purely local display controls. They do not alter the simulator's in-game radar settings, allowing the standalone display to act as an independent radar unit.
 
 ---
 

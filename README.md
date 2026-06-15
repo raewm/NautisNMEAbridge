@@ -24,17 +24,38 @@ Reads live telemetry from NAUTIS Home over its internal gRPC API and re-broadcas
 
 ### [RADAR](./RADAR/README.md)
 
-Provides a standalone, networked radar Plan Position Indicator (PPI) display for NAUTIS Home. Intercepts the simulator's ASTERIX Cat 240 radar data stream via a lightweight UDP splitter and renders it in a real-time phosphor-decay display window. Supports same-machine display or routing to a separate computer for multi-monitor bridge setups.
+Provides a standalone, networked radar Plan Position Indicator (PPI) display for NAUTIS Home. Intercepts the simulator's ASTERIX Cat 240 radar data stream and renders it in a real-time phosphor-decay display window. Supports same-machine display or routing to a separate computer for multi-monitor bridge setups.
 
 **Key Features**
 - Decodes EUROCONTROL ASTERIX Category 240 radar sweep packets in real time
 - PPI display with persistence/afterglow decay, range rings, bearing scale, and sweep line
-- Configurable range (0.25 – 24 NM), gain, sea clutter, rain clutter, and persistence
-- Forwards the full stream to the in-game radar simultaneously (no in-game functionality lost)
-- Optional gRPC link-back to the NMEA Bridge for synchronized gain/TX control
-- Runs on the simulator computer or a separate machine on the same LAN
+- Configurable range (0.25 – 24 NM), gain, sea clutter, rain clutter, and persistence (all controls are local to display)
+- Integrated background UDP splitter forwards the stream to the in-game radar simultaneously
+- Optional gRPC link to simulator/NMEA Bridge to poll own-ship heading for North Up (NU) mode
+- Distributed as a standalone Windows `.exe` (`dist/radar_display.exe`) — no Python required
 
-**Entry Points**: `RADAR/radar_splitter.py` (simulator computer), `RADAR/radar_display.py` (display computer)
+**Entry Point**: `RADAR/radar_display.py` (or `dist/radar_display.exe`)
+
+---
+
+## Port Allocation & Coexistence
+
+Both sub-projects can run simultaneously without port conflicts. Below is the complete port map for both applications:
+
+| Program / Service | Port | Protocol | Direction | Description |
+|-------------------|------|----------|-----------|-------------|
+| NAUTIS Simulator | 53457 | gRPC | Inbound | Simulator Registry API (server) |
+| NMEA Bridge | 53457 | gRPC | Outbound | Connects to poll telemetry and write autopilot commands (client) |
+| Radar Display | 53457 | gRPC | Outbound | Connects to poll own-ship heading for North Up mode (client) |
+| NMEA Bridge | 10110 | UDP | Outbound | Broadcasts NMEA 0183 sentences & AIS targets to chart plotter |
+| NMEA Bridge | 10115 | UDP | Inbound | Listens for incoming autopilot routing sentences (`$APB`) |
+| Radar Display (Splitter) | 54321 | UDP | Inbound | Intercepts simulator's raw ASTERIX Cat 240 radar stream |
+| In-Game Radar | 44444 | UDP | Inbound | Standard in-game radar display (forwarded by splitter) |
+| Radar Display (Receiver) | 54322 | UDP | Inbound | Receives radar spokes from splitter |
+
+### Coexistence details:
+- **gRPC Coexistence:** Port `53457` is the simulator's gRPC server. Both NMEA Bridge and Radar Display act as **clients** to this server. Multiple clients are fully supported and will not cause conflicts.
+- **UDP Coexistence:** The NMEA Bridge and Radar Display use completely distinct UDP ports for their telemetry and radar streams, ensuring no conflicts when running both tools at the same time.
 
 ---
 
@@ -64,8 +85,9 @@ NautisHomeMods/
 │       └── nautis_nmea_bridge.exe
 └── RADAR/
     ├── README.md           ← Full Radar Display documentation
-    ├── radar_splitter.py
-    └── radar_display.py
+    ├── radar_display.py
+    └── dist/
+        └── radar_display.exe
 ```
 
 ---
