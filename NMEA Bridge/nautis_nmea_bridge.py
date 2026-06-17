@@ -15,7 +15,7 @@ Can be run in headless CLI mode or in GUI mode with PySide6.
 #                      negative coordinates. Fix traffic vessel position/motion
 #                      lookup to search descendant entities, not just the root,
 #                      so all scenarios emit correct AIS targets.
-__version__ = "2.2.0"
+__version__ = "2.4.0"
 
 import argparse
 import math
@@ -60,6 +60,7 @@ SUBSCRIBE_TYPES = [
     "vstep.sensors.WindmeterOutput",
     "vstep.sensors.EchoSounderOutput",
     "vstep.viewports.AssignedCamera",
+    "vstep.spatial.BoundingBox",
     # Actuator components for autopilot writing
     "vstep.dynamics.AngleInput",
     "vstep.dynamics.PropulsionInput",
@@ -288,7 +289,42 @@ def make_ais_type1(mmsi: int, lat: float, lon: float, sog_kn: float, cog_deg: fl
             
     return make_ais_sentence(payload, is_own)
 
-def make_ais_type5(mmsi: int, name: str, is_own: bool = False) -> str:
+def extract_vessel_dimensions(bbox_comp) -> tuple:
+    """
+    Extract (to_bow, to_stern, to_port, to_starboard) in meters from BoundingBox component.
+    Handles coordinate system alignment dynamically using dx/dy comparison.
+    Clamps values to standard AIS bit widths (to_bow/stern: 9 bits, to_port/stbd: 6 bits).
+    """
+    if not bbox_comp:
+        return 0, 0, 0, 0
+    try:
+        box = bbox_comp.box
+        min_c = box.minimum_coordinates
+        max_c = box.maximum_coordinates
+        dy = max_c.y - min_c.y
+        dx = max_c.x - min_c.x
+        if dx > dy:
+            # X is the longitudinal axis (vessel oriented along X-axis)
+            to_bow = int(round(max(0.0, max_c.x)))
+            to_stern = int(round(max(0.0, -min_c.x)))
+            to_port = int(round(max(0.0, -min_c.y)))
+            to_starboard = int(round(max(0.0, max_c.y)))
+        else:
+            # Y is the longitudinal axis (vessel oriented along Y-axis, default)
+            to_bow = int(round(max(0.0, max_c.y)))
+            to_stern = int(round(max(0.0, -min_c.y)))
+            to_port = int(round(max(0.0, -min_c.x)))
+            to_starboard = int(round(max(0.0, max_c.x)))
+        return (
+            min(511, max(0, to_bow)),
+            min(511, max(0, to_stern)),
+            min(63, max(0, to_port)),
+            min(63, max(0, to_starboard))
+        )
+    except Exception:
+        return 0, 0, 0, 0
+
+def make_ais_type5(mmsi: int, name: str, is_own: bool = False, to_bow: int = 0, to_stern: int = 0, to_port: int = 0, to_starboard: int = 0) -> str:
     mmsi = int(mmsi) & 0x3FFFFFFF
     callsign = f"TS{str(mmsi)[-5:]}"
     
@@ -305,7 +341,9 @@ def make_ais_type5(mmsi: int, name: str, is_own: bool = False) -> str:
     bits = (bits << 42) | call_bits
     bits = (bits << 120) | name_bits
     bits = (bits << 8) | 70
-    bits = (bits << 30) | 0x1E0502
+    
+    dim_val = ((to_bow & 0x1FF) << 21) | ((to_stern & 0x1FF) << 12) | ((to_port & 0x3F) << 6) | (to_starboard & 0x3F)
+    bits = (bits << 30) | dim_val  # Dimensions: to_bow(9) | to_stern(9) | to_port(6) | to_starboard(6)
     bits = (bits << 4) | 1
     bits = (bits << 20) | 0
     bits = (bits << 8) | 0
@@ -1007,7 +1045,12 @@ class NmeaBridgeEngine(threading.Thread):
                                         last_type1_sent[own_ship_mmsi] = t_now
                                     if t_now - last_type5_sent.get(own_ship_mmsi, 0.0) >= 10.0:
                                         if self.toggles.get("aivdo"):
-                                            sentences.append(make_ais_type5(own_ship_mmsi, own_ship_name, is_own=True))
+                                            to_bow, to_stern, to_port, to_starboard = 0, 0, 0, 0
+                                            if own_ship_eid in entities:
+                                                to_bow, to_stern, to_port, to_starboard = extract_vessel_dimensions(entities[own_ship_eid].get("vstep.spatial.BoundingBox"))
+                                            sentences.append(make_ais_type5(own_ship_mmsi, own_ship_name, is_own=True,
+                                                                            to_bow=to_bow, to_stern=to_stern,
+                                                                            to_port=to_port, to_starboard=to_starboard))
                                         last_type5_sent[own_ship_mmsi] = t_now
 
                                 # Other traffic vessels AIS
@@ -1042,6 +1085,7 @@ class NmeaBridgeEngine(threading.Thread):
                                     vlin = None
                                     veuler = None
                                     vcompass = None
+                                    vbbox = None
                                     for search_eid in v_all_eids:
                                         sc = entities.get(search_eid, {})
                                         if vpos is None:
@@ -1052,6 +1096,8 @@ class NmeaBridgeEngine(threading.Thread):
                                             veuler = sc.get("vstep.spatial.OrientationEuler")
                                         if vcompass is None:
                                             vcompass = sc.get("vstep.sensors.CompassBaseOutput")
+                                        if vbbox is None:
+                                            vbbox = sc.get("vstep.spatial.BoundingBox")
                                     
                                     if vpos:
                                         vlat = vpos.position.coordinates.latitude
@@ -1078,7 +1124,10 @@ class NmeaBridgeEngine(threading.Thread):
                                             last_type1_sent[vmmsi] = t_now
                                         if t_now - last_type5_sent.get(vmmsi, 0.0) >= 10.0:
                                             if self.toggles.get("aivdm"):
-                                                sentences.append(make_ais_type5(vmmsi, vname, is_own=False))
+                                                to_bow, to_stern, to_port, to_starboard = extract_vessel_dimensions(vbbox)
+                                                sentences.append(make_ais_type5(vmmsi, vname, is_own=False,
+                                                                                to_bow=to_bow, to_stern=to_stern,
+                                                                                to_port=to_port, to_starboard=to_starboard))
                                             last_type5_sent[vmmsi] = t_now
 
                             # Send UDP packets
@@ -1167,6 +1216,7 @@ def build_classes() -> dict:
         "vstep.sensors.WindmeterOutput",
         "vstep.sensors.EchoSounderOutput",
         "vstep.viewports.AssignedCamera",
+        "vstep.spatial.BoundingBox",
         # Actuator inputs
         "vstep.dynamics.AngleInput",
         "vstep.dynamics.PropulsionInput",

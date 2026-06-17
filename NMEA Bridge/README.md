@@ -1,6 +1,6 @@
 # NAUTIS Home → NMEA 0183 UDP Bridge
 
-**Current version: `2.2.0`** — see [Changelog](#changelog) for history and exe vs. script comparison.
+**Current version: `2.4.0`** — see [Changelog](#changelog) for history and exe vs. script comparison.
 
 A production-grade, deadlock-free integration bridge that reads live telemetry from the
 [NAUTIS Home](https://vstep.nl/nautis-home/) maritime simulator and re-broadcasts it as
@@ -472,6 +472,8 @@ and executable versions are always easy to compare.
 
 | Version | Date | exe in dist/ | Notes |
 |---------|------|:---:|-------|
+| **2.4.0** | 2026-06-17 | ✅ | Dynamic vessel dimensions via gRPC BoundingBox registry component. Computes true length/beam for ownship and traffic dynamically. |
+| **2.3.0** | 2026-06-17 | ❌ | Fix AIS Type 5 (`!AIVDM`) vessel dimensions. Hardcoded value `0x1E0502` (480 m × 22 m) replaced with 0 (ITU-R M.1371 “not available”). All targets now report unknown dimensions instead of an incorrect 480 m ship footprint. |
 | **2.2.0** | 2026-06-15 | ✅ | Fix AIS Type 1 lat/lon encoding for negative coordinates. Resolve traffic vessel position/motion components across descendants. Fix autopilot preset slider crash on start. |
 | **2.1.0** | 2026-06-14 | ❌ outdated | Reorganised project into `NautisHomeMods/NMEA Bridge/`. Added single-source versioning. |
 | **2.0.0** | 2026-06-07 | ✅ | Integrated autopilot with Heading & Route (`$APB`) modes. Vessel response preset slider, pop-out AP window, compact mode, magnetic variation offset. |
