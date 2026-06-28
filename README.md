@@ -1,6 +1,6 @@
 # NautisHomeMods
 
-A collection of standalone integration extensions and tools for the [NAUTIS Home](https://vstep.nl/nautis-home/) maritime simulator by VSTEP. Each sub-project is self-contained and can be used independently.
+A collection of standalone integration extensions and tools for the NAUTIS Home maritime simulator. Each sub-project is self-contained and can be used independently.
 
 ---
 
@@ -15,7 +15,6 @@ Reads live telemetry from NAUTIS Home and re-broadcasts it as standard NMEA 0183
 - Full Class A AIS traffic (Type 1 + Type 5) for all scenario vessels
 - Integrated autopilot with Heading Hold and Route (OpenCPN `$APB`) modes
 - Pre-tuned vessel presets and full PID override
-- Deadlock-free connection architecture — maintains simulator performance during long runs
 - Distributed as a standalone Windows `.exe` (`dist/nautis_nmea_bridge.exe`) — no Python required
 
 **Executable**: `NMEA Bridge/dist/nautis_nmea_bridge.exe`
@@ -54,10 +53,6 @@ Both sub-projects can run simultaneously without port conflicts. Below is the co
 | In-Game Radar | 44444 | UDP | Inbound | Standard in-game radar display (forwarded by splitter) |
 | Radar Display (Receiver) | 54322 | UDP | Inbound | Receives radar spokes from splitter |
 
-### Coexistence details:
-- **Simulator Connection Coexistence:** Port `53457` is the simulator's telemetry and control port. Both NMEA Bridge and Radar Display connect to this port. Multiple concurrent connections are fully supported.
-- **UDP Coexistence:** The NMEA Bridge and Radar Display use completely distinct UDP ports for their telemetry and radar streams, ensuring no conflicts when running both tools at the same time.
-
 ---
 
 ## Shared Requirements
@@ -84,10 +79,3 @@ NautisHomeMods/
         └── radar_display.exe
 ```
 
----
-
-## Adding Future Sub-Projects
-
-Create a new subdirectory under `NautisHomeMods/` and add an entry to this file following the pattern above. Each sub-project should include:
-1. A `README.md` covering setup, dependencies, usage, and architecture
-2. A brief summary entry here with key features and entry points
